@@ -1,6 +1,6 @@
-// BLACK TUNE RECORD v2
+// BLACK TUNE RECORD v3
 // - YIN pitch tracking with median filter, hysteresis and hold (precise, no flicker)
-// - Pitch-synchronous shifter (window locked to the voice period -> far cleaner)
+// - PSOLA engine: output pitch set directly from the target note (exact), formants kept
 // - Premium custom GUI: LED tuner, glossy keyboard, metal knobs, presets
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <algorithm>
@@ -77,21 +77,29 @@ public:
     void prepareToPlay(double sampleRate, int) override
     {
         sr = sampleRate;
-        latency = (int) std::round(0.010 * sr);
-        setLatencySamples(latency);
+        delay0 = (int) std::ceil(2.95 * sr / 90.0);   // fixed latency of the PSOLA engine
+        setLatencySamples(delay0);
 
         for (auto& v : dl)   v.assign(kBuf, 0.f);
+        for (auto& v : outB) v.assign(kBuf, 0.f);
         for (auto& v : comb) v.assign(kBuf, 0.f);
         det.assign(kBuf, 0.f);
+        lp.assign(kBuf, 0.f);
         scratch.assign((size_t) kBuf, 0.f);
         yin.assign((size_t) kBuf, 0.f);
 
         wp = 0; hopCount = 0;
         hop = juce::jmax(64, (int) (0.0058 * sr));
-        Wf = Wgoal = (float) (0.02 * sr);
-        phase = 0.f; curRatio = 1.f; targetRatio = 1.f;
-        targetFreq = 200.f; combT = (float) (sr / 200.0);
+        T0cur = (float) (sr / 200.0);
+        curMidiOut = targetMidiOut = 69.f + 12.f * std::log2(200.f / 440.f);
+        outFreq = 200.f;
+        nextTs = 0.0;
+        anaMark = nextTs - (double) delay0;
+        combT = (float) (sr / 200.0);
+        lpState = 0.f;
+        snapOn = false;
         histN = 0; histIdx = 0; unvoicedHops = 0; curNote = -1;
+        meterVoiced = false;
     }
     void releaseResources() override {}
 
@@ -115,6 +123,7 @@ public:
         const float coef = retMs <= 0.01f ? minCoef
                          : juce::jmax(minCoef, 1.f - std::exp(-1.f / (retMs * 0.001f * (float) sr)));
         const float releaseCoef = 1.f - std::exp(-1.f / (0.02f * (float) sr));
+        const float lpA = 1.f - std::exp(-juce::MathConstants<float>::twoPi * 900.f / (float) sr);
 
         const float drive = 1.f + grit * 6.f;
         const float invDrive = 1.f / std::sqrt(drive);
@@ -128,35 +137,35 @@ public:
         for (int i = 0; i < n; ++i)
         {
             float mono = 0.f;
-            for (int c = 0; c < nCh; ++c) mono += buf.getReadPointer(c)[i];
+            for (int c = 0; c < nCh; ++c)
+            {
+                const float in = buf.getReadPointer(c)[i];
+                dl[(size_t) c][(size_t) (wp & kMask)] = in;
+                mono += in;
+            }
             mono /= (float) nCh;
-
             det[(size_t) (wp & kMask)] = mono;
+            lpState += lpA * (mono - lpState);
+            lp[(size_t) (wp & kMask)] = lpState;
+
             if (++hopCount >= hop) { hopCount = 0; detect(); }
 
-            const float useCoef = meterVoiced.load() ? coef : releaseCoef;
-            curRatio += useCoef * (targetRatio - curRatio);
-            combT    += 0.002f * ((float) (sr / targetFreq) - combT);
-            combT = juce::jlimit(8.f, (float) (kBuf - 4), combT);
-            Wf += 0.0002f * (Wgoal - Wf);
+            curMidiOut += (meterVoiced.load() ? coef : releaseCoef) * (targetMidiOut - curMidiOut);
+            curMidiOut = juce::jlimit(20.f, 120.f, curMidiOut);
 
-            phase += (1.f - curRatio) / Wf;
-            phase -= std::floor(phase);
-            float ph2 = phase + 0.5f; ph2 -= std::floor(ph2);
-            const float g1 = 0.5f - 0.5f * std::cos(juce::MathConstants<float>::twoPi * phase);
-            const float g2 = 0.5f - 0.5f * std::cos(juce::MathConstants<float>::twoPi * ph2);
-            const float d1 = phase * Wf + 1.f;
-            const float d2 = ph2 * Wf + 1.f;
+            generateGrains(nCh);
+
+            combT += 0.002f * ((float) (sr / (double) outFreq) - combT);
+            combT = juce::jlimit(8.f, (float) (kBuf - 4), combT);
 
             for (int c = 0; c < nCh; ++c)
             {
                 float* io = buf.getWritePointer(c);
-                const float in = io[i];
-                dl[(size_t) c][(size_t) (wp & kMask)] = in;
 
-                float wet = g1 * readFrac(dl[(size_t) c], d1) + g2 * readFrac(dl[(size_t) c], d2);
+                float wet = outB[(size_t) c][(size_t) (wp & kMask)];
+                outB[(size_t) c][(size_t) (wp & kMask)] = 0.f;
 
-                const float yc = wet + fb * readFrac(comb[(size_t) c], combT);
+                const float yc = wet + fb * readAt(comb[(size_t) c], (double) wp - (double) combT);
                 comb[(size_t) c][(size_t) (wp & kMask)] = yc;
                 wet = yc * combNorm;
 
@@ -166,7 +175,7 @@ public:
                     wet = std::round(wet * levels) / levels;
                 }
 
-                const float dry = dl[(size_t) c][(size_t) ((wp - latency) & kMask)];
+                const float dry = dl[(size_t) c][(size_t) ((wp - delay0) & kMask)];
                 float out = (dry * (1.f - mix) + wet * mix) * outGain;
                 out = softClip(out);
                 io[i] = out;
@@ -185,28 +194,84 @@ public:
     std::atomic<float> outLevel { 0.f };
 
 private:
-    static constexpr int kBuf = 1 << 14;
+    static constexpr int kBuf = 1 << 15;
     static constexpr int kMask = kBuf - 1;
 
     double sr = 44100.0;
-    int latency = 441, wp = 0, hopCount = 0, hop = 256;
-    float Wf = 880.f, Wgoal = 880.f;
-    float phase = 0.f, curRatio = 1.f, targetRatio = 1.f, targetFreq = 200.f, combT = 200.f;
+    int delay0 = 1500, hopCount = 0, hop = 256;
+    long long wp = 0;
+    double nextTs = 0.0, anaMark = 0.0;
+    float T0cur = 220.f, curMidiOut = 55.f, targetMidiOut = 55.f, outFreq = 200.f, combT = 200.f;
+    float lpState = 0.f;
+    bool snapOn = false;
     int keyIdx = 0, scaleIdx = 0;
     float amountP = 1.f;
     float hist[5] = { 0, 0, 0, 0, 0 };
     int histN = 0, histIdx = 0, unvoicedHops = 0, curNote = -1;
-    std::array<std::vector<float>, 2> dl, comb;
-    std::vector<float> det, scratch, yin;
+    std::array<std::vector<float>, 2> dl, outB, comb;
+    std::vector<float> det, lp, scratch, yin;
 
-    float readFrac(const std::vector<float>& b, float delay) const
+    float readAt(const std::vector<float>& b, double pos) const
     {
-        const float pos = (float) wp - delay;
-        const int i0 = (int) std::floor(pos);
-        const float f = pos - (float) i0;
+        const long long i0 = (long long) std::floor(pos);
+        const float f = (float) (pos - (double) i0);
         const float a = b[(size_t) (i0 & kMask)];
         const float c = b[(size_t) ((i0 + 1) & kMask)];
         return a + f * (c - a);
+    }
+
+    // next analysis mark one period after 'a', snapped to the nearest waveform peak when voiced
+    double nextAnaMark(double a, double T) const
+    {
+        const double nominal = a + T;
+        if (!snapOn) return nominal;
+        const long long lo = (long long) std::floor(nominal - 0.25 * T);
+        const long long hi = (long long) std::ceil(nominal + 0.25 * T);
+        long long bestI = (long long) std::llround(nominal);
+        float bestV = -1e9f;
+        for (long long i = lo; i <= hi; ++i)
+        {
+            const float v = lp[(size_t) (i & kMask)];
+            if (v > bestV) { bestV = v; bestI = i; }
+        }
+        return (double) bestI;
+    }
+
+    // PSOLA: grains of two periods, placed exactly at the spacing of the TARGET note
+    void generateGrains(int nCh)
+    {
+        const double T = (double) T0cur;
+        if (nextTs < (double) (wp - 4096)) nextTs = (double) wp;
+
+        while (nextTs <= (double) wp + 1.15 * T)
+        {
+            const int Ti = juce::jmax(8, (int) std::llround(T));
+            const double tdes = nextTs - (double) delay0;
+
+            int guard = 0;
+            while (std::abs(anaMark + T - tdes) < std::abs(anaMark - tdes) && guard++ < 16)
+                anaMark = nextAnaMark(anaMark, T);
+            if (guard >= 16) anaMark = tdes;
+
+            if (anaMark + (double) Ti + 2.0 > (double) wp) anaMark = (double) (wp - Ti - 2);
+            if (anaMark - (double) Ti < (double) (wp - kBuf + 8)) anaMark = (double) (wp - kBuf + 8 + Ti);
+
+            const double curFreq = 440.0 * std::pow(2.0, ((double) curMidiOut - 69.0) / 12.0);
+            const double Ts = juce::jlimit(sr / 2000.0, sr / 40.0, sr / curFreq);
+            outFreq = (float) curFreq;
+            const float scale = (float) (Ts / T);
+
+            const long long tsInt = (long long) std::floor(nextTs + 0.5);
+            const double frac = nextTs - (double) tsInt;
+
+            for (int k = -Ti; k <= Ti; ++k)
+            {
+                const float w = (0.5f + 0.5f * std::cos(juce::MathConstants<float>::pi * (float) k / (float) Ti)) * scale;
+                for (int c = 0; c < nCh; ++c)
+                    outB[(size_t) c][(size_t) ((tsInt + k) & kMask)] += w * readAt(dl[(size_t) c], anaMark + (double) k - frac);
+            }
+            nextTs += Ts;
+        }
     }
 
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout()
@@ -234,7 +299,7 @@ private:
     {
         const int N = (int) (0.0175 * sr);
         const int minTau = (int) (sr / 800.0);
-        const int maxTau = (int) (sr / 70.0);
+        const int maxTau = (int) (sr / 90.0);
         const int total = N + maxTau;
         const int holdHops = juce::jmax(1, (int) std::ceil(0.08 * sr / (double) hop));
 
@@ -265,18 +330,11 @@ private:
             int found = -1;
             for (int tau = juce::jmax(2, minTau); tau < maxTau; ++tau)
             {
-                if (yin[(size_t) tau] < 0.12f)
+                if (yin[(size_t) tau] < 0.15f)
                 {
                     while (tau + 1 < maxTau && yin[(size_t) tau + 1] < yin[(size_t) tau]) ++tau;
                     found = tau; break;
                 }
-            }
-            if (found < 0)
-            {
-                float mn = 1e9f; int mt = -1;
-                for (int tau = juce::jmax(2, minTau); tau < maxTau; ++tau)
-                    if (yin[(size_t) tau] < mn) { mn = yin[(size_t) tau]; mt = tau; }
-                if (mn < 0.2f) found = mt;
             }
 
             if (found >= 2)
@@ -295,7 +353,9 @@ private:
         {
             if (++unvoicedHops > holdHops)
             {
-                targetRatio = 1.f;
+                // no pitch: pass the voice through untouched
+                targetMidiOut = 69.f + 12.f * std::log2(((float) sr / T0cur) / 440.f);
+                snapOn = false;
                 meterVoiced = false;
                 histN = 0; histIdx = 0; curNote = -1;
             }
@@ -303,7 +363,7 @@ private:
         }
         unvoicedHops = 0;
 
-        // median filter over the last detections (kills octave glitches)
+        // median filter over the last detections (removes octave glitches)
         hist[histIdx] = midiRaw;
         histIdx = (histIdx + 1) % 5;
         histN = juce::jmin(5, histN + 1);
@@ -332,15 +392,13 @@ private:
         curNote = cand;
         const float best = (float) curNote;
 
-        targetRatio = std::pow(2.f, ((best - m) * amountP) / 12.f);
-        targetFreq = 440.f * std::pow(2.f, ((m + (best - m) * amountP) - 69.f) / 12.f);
+        // the output pitch is set directly from the target note (exact), not from a ratio
+        targetMidiOut = m + (best - m) * amountP;
 
-        // pitch-synchronous window: two taps exactly one (or more) period apart
-        const float T0 = (float) sr / (440.f * std::pow(2.f, (med - 69.f) / 12.f));
-        const int mult = juce::jmax(1, (int) std::ceil(0.008 * sr / (2.0 * (double) T0)));
-        float wt = 2.f * (float) mult * T0;
-        wt = juce::jlimit(0.006f * (float) sr, 0.035f * (float) sr, wt);
-        if (std::abs(wt - Wgoal) > 0.04f * Wgoal) Wgoal = wt;
+        // analysis period for the grains
+        const float T0meas = (float) sr / (440.f * std::pow(2.f, (med - 69.f) / 12.f));
+        T0cur = juce::jlimit((float) (sr / 800.0), (float) (sr / 90.0), T0meas);
+        snapOn = true;
 
         meterDetected = m;
         meterTarget = best;
