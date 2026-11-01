@@ -1,8 +1,13 @@
-// BLACK TUNE RECORD - aggressive hard-tune / robot vocal effect with custom GUI
+// BLACK TUNE RECORD v2
+// - YIN pitch tracking with median filter, hysteresis and hold (precise, no flicker)
+// - Pitch-synchronous shifter (window locked to the voice period -> far cleaner)
+// - Premium custom GUI: LED tuner, glossy keyboard, metal knobs, presets
 #include <juce_audio_processors/juce_audio_processors.h>
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <utility>
 #include <vector>
 
 static juce::StringArray keyNames()
@@ -18,6 +23,13 @@ static int scaleMask(int idx)
 {
     static const int masks[5] = { 0xFFF, 0xAB5, 0x5AD, 0x4A9, 0x9AD };
     return masks[juce::jlimit(0, 4, idx)];
+}
+static float softClip(float x)
+{
+    const float a = std::abs(x);
+    if (a < 0.9f) return x;
+    const float s = 0.9f + 0.1f * std::tanh((a - 0.9f) / 0.1f);
+    return x < 0.f ? -s : s;
 }
 
 //==============================================================================
@@ -65,8 +77,8 @@ public:
     void prepareToPlay(double sampleRate, int) override
     {
         sr = sampleRate;
-        W = (int) std::round(0.023 * sr);
-        setLatencySamples(W / 2);
+        latency = (int) std::round(0.010 * sr);
+        setLatencySamples(latency);
 
         for (auto& v : dl)   v.assign(kBuf, 0.f);
         for (auto& v : comb) v.assign(kBuf, 0.f);
@@ -74,9 +86,12 @@ public:
         scratch.assign((size_t) kBuf, 0.f);
         yin.assign((size_t) kBuf, 0.f);
 
-        wp = 0; hopCount = 0; hop = 512;
+        wp = 0; hopCount = 0;
+        hop = juce::jmax(64, (int) (0.0058 * sr));
+        Wf = Wgoal = (float) (0.02 * sr);
         phase = 0.f; curRatio = 1.f; targetRatio = 1.f;
         targetFreq = 200.f; combT = (float) (sr / 200.0);
+        histN = 0; histIdx = 0; unvoicedHops = 0; curNote = -1;
     }
     void releaseResources() override {}
 
@@ -91,16 +106,24 @@ public:
         const float robot  = *apvts.getRawParameterValue("robot");
         const float grit   = *apvts.getRawParameterValue("grit");
         const float mix    = *apvts.getRawParameterValue("mix");
+        const float outDb  = *apvts.getRawParameterValue("output");
         keyIdx   = (int) *apvts.getRawParameterValue("key");
         scaleIdx = (int) *apvts.getRawParameterValue("scale");
         amountP = amount;
 
-        const float coef = retMs <= 0.01f ? 1.f
-                         : 1.f - std::exp(-1.f / (retMs * 0.001f * (float) sr));
-        const float drive = 1.f + grit * 9.f;
-        const float levels = std::pow(2.f, 16.f - grit * 11.f);
-        const float fb = robot * 0.85f;
+        const float minCoef = 1.f - std::exp(-1.f / (0.0015f * (float) sr));
+        const float coef = retMs <= 0.01f ? minCoef
+                         : juce::jmax(minCoef, 1.f - std::exp(-1.f / (retMs * 0.001f * (float) sr)));
+        const float releaseCoef = 1.f - std::exp(-1.f / (0.02f * (float) sr));
+
+        const float drive = 1.f + grit * 6.f;
+        const float invDrive = 1.f / std::sqrt(drive);
+        const float levels = std::pow(2.f, 16.f - grit * 8.f);
+        const float fb = robot * 0.7f;
         const float combNorm = 1.f / (1.f + fb * 0.6f);
+        const float outGain = juce::Decibels::decibelsToGain(outDb);
+
+        float pk = 0.f;
 
         for (int i = 0; i < n; ++i)
         {
@@ -111,17 +134,19 @@ public:
             det[(size_t) (wp & kMask)] = mono;
             if (++hopCount >= hop) { hopCount = 0; detect(); }
 
-            curRatio += coef * (targetRatio - curRatio);
+            const float useCoef = meterVoiced.load() ? coef : releaseCoef;
+            curRatio += useCoef * (targetRatio - curRatio);
             combT    += 0.002f * ((float) (sr / targetFreq) - combT);
             combT = juce::jlimit(8.f, (float) (kBuf - 4), combT);
+            Wf += 0.0002f * (Wgoal - Wf);
 
-            phase += (1.f - curRatio) / (float) W;
+            phase += (1.f - curRatio) / Wf;
             phase -= std::floor(phase);
             float ph2 = phase + 0.5f; ph2 -= std::floor(ph2);
             const float g1 = 0.5f - 0.5f * std::cos(juce::MathConstants<float>::twoPi * phase);
             const float g2 = 0.5f - 0.5f * std::cos(juce::MathConstants<float>::twoPi * ph2);
-            const float d1 = phase * (float) W + 1.f;
-            const float d2 = ph2 * (float) W + 1.f;
+            const float d1 = phase * Wf + 1.f;
+            const float d2 = ph2 * Wf + 1.f;
 
             for (int c = 0; c < nCh; ++c)
             {
@@ -131,18 +156,25 @@ public:
 
                 float wet = g1 * readFrac(dl[(size_t) c], d1) + g2 * readFrac(dl[(size_t) c], d2);
 
-                float yc = wet + fb * readFrac(comb[(size_t) c], combT);
+                const float yc = wet + fb * readFrac(comb[(size_t) c], combT);
                 comb[(size_t) c][(size_t) (wp & kMask)] = yc;
                 wet = yc * combNorm;
 
-                wet = std::tanh(wet * drive);
-                wet = std::round(wet * levels) / levels;
+                if (grit > 0.001f)
+                {
+                    wet = std::tanh(wet * drive) * invDrive;
+                    wet = std::round(wet * levels) / levels;
+                }
 
-                const float dry = dl[(size_t) c][(size_t) ((wp - W / 2) & kMask)];
-                io[i] = dry * (1.f - mix) + wet * mix;
+                const float dry = dl[(size_t) c][(size_t) ((wp - latency) & kMask)];
+                float out = (dry * (1.f - mix) + wet * mix) * outGain;
+                out = softClip(out);
+                io[i] = out;
+                pk = juce::jmax(pk, std::abs(out));
             }
             ++wp;
         }
+        outLevel.store(juce::jmax(pk, outLevel.load() * 0.9f));
     }
 
     // shared with the editor
@@ -150,16 +182,20 @@ public:
     std::atomic<float> meterDetected { 0.f };
     std::atomic<float> meterTarget { 0.f };
     std::atomic<bool> meterVoiced { false };
+    std::atomic<float> outLevel { 0.f };
 
 private:
     static constexpr int kBuf = 1 << 14;
     static constexpr int kMask = kBuf - 1;
 
     double sr = 44100.0;
-    int W = 1024, wp = 0, hopCount = 0, hop = 512;
+    int latency = 441, wp = 0, hopCount = 0, hop = 256;
+    float Wf = 880.f, Wgoal = 880.f;
     float phase = 0.f, curRatio = 1.f, targetRatio = 1.f, targetFreq = 200.f, combT = 200.f;
     int keyIdx = 0, scaleIdx = 0;
     float amountP = 1.f;
+    float hist[5] = { 0, 0, 0, 0, 0 };
+    int histN = 0, histIdx = 0, unvoicedHops = 0, curNote = -1;
     std::array<std::vector<float>, 2> dl, comb;
     std::vector<float> det, scratch, yin;
 
@@ -184,11 +220,13 @@ private:
         l.add(std::make_unique<AudioParameterFloat>(ParameterID{"amount", 1}, "Amount",
               NormalisableRange<float>(0.f, 1.f, 0.001f), 1.f));
         l.add(std::make_unique<AudioParameterFloat>(ParameterID{"robot", 1}, "Robot",
-              NormalisableRange<float>(0.f, 1.f, 0.001f), 0.5f));
-        l.add(std::make_unique<AudioParameterFloat>(ParameterID{"grit", 1}, "Grit",
               NormalisableRange<float>(0.f, 1.f, 0.001f), 0.3f));
+        l.add(std::make_unique<AudioParameterFloat>(ParameterID{"grit", 1}, "Grit",
+              NormalisableRange<float>(0.f, 1.f, 0.001f), 0.f));
         l.add(std::make_unique<AudioParameterFloat>(ParameterID{"mix", 1}, "Mix",
               NormalisableRange<float>(0.f, 1.f, 0.001f), 1.f));
+        l.add(std::make_unique<AudioParameterFloat>(ParameterID{"output", 1}, "Output",
+              NormalisableRange<float>(-12.f, 12.f, 0.1f), 0.f));
         return l;
     }
 
@@ -198,62 +236,113 @@ private:
         const int minTau = (int) (sr / 800.0);
         const int maxTau = (int) (sr / 70.0);
         const int total = N + maxTau;
+        const int holdHops = juce::jmax(1, (int) std::ceil(0.08 * sr / (double) hop));
 
         float energy = 0.f;
         for (int j = 0; j < total; ++j)
             scratch[(size_t) j] = det[(size_t) ((wp - total + j) & kMask)];
         for (int j = maxTau; j < total; ++j) energy += scratch[(size_t) j] * scratch[(size_t) j];
-        if (std::sqrt(energy / (float) N) < 0.004f) { targetRatio = 1.f; meterVoiced = false; return; }
 
-        float cum = 0.f;
-        yin[0] = 1.f;
-        for (int tau = 1; tau <= maxTau; ++tau)
+        bool voiced = false;
+        float midiRaw = 0.f;
+
+        if (std::sqrt(energy / (float) N) >= 0.004f)
         {
-            float d = 0.f;
-            for (int j = 0; j < N; ++j)
+            float cum = 0.f;
+            yin[0] = 1.f;
+            for (int tau = 1; tau <= maxTau; ++tau)
             {
-                const float x = scratch[(size_t) (maxTau + j)] - scratch[(size_t) (maxTau + j - tau)];
-                d += x * x;
+                float d = 0.f;
+                for (int j = 0; j < N; j += 2)
+                {
+                    const float x = scratch[(size_t) (maxTau + j)] - scratch[(size_t) (maxTau + j - tau)];
+                    d += x * x;
+                }
+                cum += d;
+                yin[(size_t) tau] = cum > 0.f ? d * (float) tau / cum : 1.f;
             }
-            cum += d;
-            yin[(size_t) tau] = cum > 0.f ? d * (float) tau / cum : 1.f;
+
+            int found = -1;
+            for (int tau = juce::jmax(2, minTau); tau < maxTau; ++tau)
+            {
+                if (yin[(size_t) tau] < 0.12f)
+                {
+                    while (tau + 1 < maxTau && yin[(size_t) tau + 1] < yin[(size_t) tau]) ++tau;
+                    found = tau; break;
+                }
+            }
+            if (found < 0)
+            {
+                float mn = 1e9f; int mt = -1;
+                for (int tau = juce::jmax(2, minTau); tau < maxTau; ++tau)
+                    if (yin[(size_t) tau] < mn) { mn = yin[(size_t) tau]; mt = tau; }
+                if (mn < 0.2f) found = mt;
+            }
+
+            if (found >= 2)
+            {
+                float tauEst = (float) found;
+                const float s0 = yin[(size_t) found - 1], s1 = yin[(size_t) found], s2 = yin[(size_t) found + 1];
+                const float den = s0 - 2.f * s1 + s2;
+                if (std::abs(den) > 1e-9f) tauEst += 0.5f * (s0 - s2) / den;
+                const float f0 = (float) sr / tauEst;
+                midiRaw = 69.f + 12.f * std::log2(f0 / 440.f);
+                voiced = true;
+            }
         }
 
-        int found = -1;
-        for (int tau = juce::jmax(2, minTau); tau < maxTau; ++tau)
+        if (!voiced)
         {
-            if (yin[(size_t) tau] < 0.15f)
+            if (++unvoicedHops > holdHops)
             {
-                while (tau + 1 < maxTau && yin[(size_t) tau + 1] < yin[(size_t) tau]) ++tau;
-                found = tau; break;
+                targetRatio = 1.f;
+                meterVoiced = false;
+                histN = 0; histIdx = 0; curNote = -1;
             }
+            return;
         }
-        if (found < 0) { targetRatio = 1.f; meterVoiced = false; return; }
+        unvoicedHops = 0;
 
-        float tauEst = (float) found;
-        const float s0 = yin[(size_t) found - 1], s1 = yin[(size_t) found], s2 = yin[(size_t) found + 1];
-        const float den = s0 - 2.f * s1 + s2;
-        if (std::abs(den) > 1e-9f) tauEst += 0.5f * (s0 - s2) / den;
+        // median filter over the last detections (kills octave glitches)
+        hist[histIdx] = midiRaw;
+        histIdx = (histIdx + 1) % 5;
+        histN = juce::jmin(5, histN + 1);
+        float tmp[5];
+        for (int i = 0; i < histN; ++i) tmp[i] = hist[i];
+        std::sort(tmp, tmp + histN);
+        const float med = tmp[histN / 2];
+        const float m = std::abs(midiRaw - med) < 0.7f ? midiRaw : med;
 
-        const float f0 = (float) sr / tauEst;
-        const float midi = 69.f + 12.f * std::log2(f0 / 440.f);
-
+        // choose target note with hysteresis (no flicker between notes)
         const int mask = scaleMask(scaleIdx);
-        float best = midi; float bestDist = 1e9f;
-        const int base = (int) std::round(midi);
+        auto allowed = [&](int note) { return ((mask >> (((note - keyIdx) % 12 + 12) % 12)) & 1) != 0; };
+
+        int cand = (int) std::round(med);
+        float bestDist = 1e9f;
         for (int o = -6; o <= 6; ++o)
         {
-            const int note = base + o;
-            const int rel = ((note - keyIdx) % 12 + 12) % 12;
-            if (!((mask >> rel) & 1)) continue;
-            const float dist = std::abs((float) note - midi);
-            if (dist < bestDist) { bestDist = dist; best = (float) note; }
+            const int note = (int) std::round(med) + o;
+            if (!allowed(note)) continue;
+            const float dist = std::abs((float) note - med);
+            if (dist < bestDist) { bestDist = dist; cand = note; }
         }
+        if (curNote >= 0 && allowed(curNote) && cand != curNote
+            && std::abs(med - (float) cand) + 0.15f > std::abs(med - (float) curNote))
+            cand = curNote;
+        curNote = cand;
+        const float best = (float) curNote;
 
-        targetRatio = std::pow(2.f, ((best - midi) * amountP) / 12.f);
-        targetFreq = 440.f * std::pow(2.f, ((midi + (best - midi) * amountP) - 69.f) / 12.f);
+        targetRatio = std::pow(2.f, ((best - m) * amountP) / 12.f);
+        targetFreq = 440.f * std::pow(2.f, ((m + (best - m) * amountP) - 69.f) / 12.f);
 
-        meterDetected = midi;
+        // pitch-synchronous window: two taps exactly one (or more) period apart
+        const float T0 = (float) sr / (440.f * std::pow(2.f, (med - 69.f) / 12.f));
+        const int mult = juce::jmax(1, (int) std::ceil(0.008 * sr / (2.0 * (double) T0)));
+        float wt = 2.f * (float) mult * T0;
+        wt = juce::jlimit(0.006f * (float) sr, 0.035f * (float) sr, wt);
+        if (std::abs(wt - Wgoal) > 0.04f * Wgoal) Wgoal = wt;
+
+        meterDetected = m;
         meterTarget = best;
         meterVoiced = true;
     }
@@ -262,40 +351,116 @@ private:
 };
 
 //==============================================================================
-// Look and feel: black metal knobs with a red value arc and gold pointer
+static const juce::Colour kGold(0xfff5c542);
+static const juce::Colour kRed(0xffe02020);
+
 class BTLookAndFeel : public juce::LookAndFeel_V4
 {
 public:
+    BTLookAndFeel()
+    {
+        setColour(juce::PopupMenu::backgroundColourId, juce::Colour(0xff111111));
+        setColour(juce::PopupMenu::textColourId, juce::Colours::white);
+        setColour(juce::PopupMenu::highlightedBackgroundColourId, kRed);
+        setColour(juce::PopupMenu::highlightedTextColourId, juce::Colours::white);
+    }
+
     void drawRotarySlider(juce::Graphics& g, int x, int y, int width, int height,
                           float sliderPos, float startAngle, float endAngle, juce::Slider&) override
     {
-        auto bounds = juce::Rectangle<float>((float) x, (float) y, (float) width, (float) height).reduced(8.f);
+        auto bounds = juce::Rectangle<float>((float) x, (float) y, (float) width, (float) height).reduced(12.f);
         const float r = juce::jmin(bounds.getWidth(), bounds.getHeight()) / 2.f;
         const auto c = bounds.getCentre();
         const float ang = startAngle + sliderPos * (endAngle - startAngle);
 
+        // scale ticks
+        for (int i = 0; i <= 20; ++i)
+        {
+            const float a = startAngle + (float) i / 20.f * (endAngle - startAngle);
+            const float s = std::sin(a), co = std::cos(a);
+            const bool major = (i % 5 == 0);
+            const float r1 = r + 3.f, r2 = r + (major ? 9.f : 6.f);
+            g.setColour(juce::Colours::white.withAlpha(major ? 0.5f : 0.2f));
+            g.drawLine(c.x + s * r1, c.y - co * r1, c.x + s * r2, c.y - co * r2, major ? 1.6f : 1.f);
+        }
+
+        const float arcR = r - 3.f;
         juce::Path track;
-        track.addCentredArc(c.x, c.y, r, r, 0.f, startAngle, endAngle, true);
-        g.setColour(juce::Colour(0xff2a2a2a));
-        g.strokePath(track, juce::PathStrokeType(5.f));
+        track.addCentredArc(c.x, c.y, arcR, arcR, 0.f, startAngle, endAngle, true);
+        g.setColour(juce::Colour(0xff262626));
+        g.strokePath(track, juce::PathStrokeType(4.f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
 
-        juce::Path val;
-        val.addCentredArc(c.x, c.y, r, r, 0.f, startAngle, ang, true);
-        g.setColour(juce::Colour(0xffe02020));
-        g.strokePath(val, juce::PathStrokeType(5.f, juce::PathStrokeType::curved,
-                                               juce::PathStrokeType::rounded));
+        if (sliderPos > 0.002f)
+        {
+            juce::Path val;
+            val.addCentredArc(c.x, c.y, arcR, arcR, 0.f, startAngle, ang, true);
+            g.setColour(kGold.withAlpha(0.18f));
+            g.strokePath(val, juce::PathStrokeType(10.f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+            g.setColour(kGold);
+            g.strokePath(val, juce::PathStrokeType(3.5f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+        }
 
-        const float br = r - 9.f;
-        g.setGradientFill(juce::ColourGradient(juce::Colour(0xff555555), c.x - br * 0.5f, c.y - br * 0.7f,
-                                               juce::Colour(0xff0c0c0c), c.x + br * 0.6f, c.y + br * 0.8f, false));
-        g.fillEllipse(c.x - br, c.y - br, br * 2.f, br * 2.f);
-        g.setColour(juce::Colours::black);
-        g.drawEllipse(c.x - br, c.y - br, br * 2.f, br * 2.f, 2.f);
+        // metal bezel
+        const float bezelR = arcR - 5.f;
+        g.setGradientFill(juce::ColourGradient(juce::Colour(0xff767676), c.x - bezelR * 0.4f, c.y - bezelR * 0.6f,
+                                               juce::Colour(0xff0d0d0d), c.x + bezelR * 0.9f, c.y + bezelR * 0.9f, false));
+        g.fillEllipse(c.x - bezelR, c.y - bezelR, bezelR * 2.f, bezelR * 2.f);
+
+        // knurling
+        g.setColour(juce::Colours::black.withAlpha(0.55f));
+        for (int i = 0; i < 36; ++i)
+        {
+            const float a = (float) i * juce::MathConstants<float>::twoPi / 36.f;
+            const float s = std::sin(a), co = std::cos(a);
+            g.drawLine(c.x + s * (bezelR - 2.5f), c.y - co * (bezelR - 2.5f),
+                       c.x + s * bezelR, c.y - co * bezelR, 1.f);
+        }
+
+        // cap
+        const float capR = bezelR - 4.f;
+        g.setGradientFill(juce::ColourGradient(juce::Colour(0xff535353), c.x - capR * 0.3f, c.y - capR * 0.4f,
+                                               juce::Colour(0xff121212), c.x + capR * 0.8f, c.y + capR * 0.9f, true));
+        g.fillEllipse(c.x - capR, c.y - capR, capR * 2.f, capR * 2.f);
+        g.setColour(juce::Colours::white.withAlpha(0.10f));
+        g.fillEllipse(c.x - capR * 0.6f, c.y - capR * 0.85f, capR * 1.0f, capR * 0.5f);
 
         juce::Path p;
-        p.addRoundedRectangle(-2.f, -br + 3.f, 4.f, br * 0.45f, 1.5f);
-        g.setColour(juce::Colour(0xfff5c542));
+        p.addRoundedRectangle(-1.6f, -capR + 2.f, 3.2f, capR * 0.5f, 1.5f);
+        g.setColour(kGold);
         g.fillPath(p, juce::AffineTransform::rotation(ang).translated(c.x, c.y));
+    }
+
+    void drawButtonBackground(juce::Graphics& g, juce::Button& b, const juce::Colour&,
+                              bool highlighted, bool down) override
+    {
+        auto r = b.getLocalBounds().toFloat().reduced(0.5f);
+        juce::Colour top(0xff2d2d2d), bot(0xff0d0d0d);
+        if (highlighted) top = top.brighter(0.25f);
+        if (down) std::swap(top, bot);
+        g.setGradientFill(juce::ColourGradient(top, 0.f, r.getY(), bot, 0.f, r.getBottom(), false));
+        g.fillRoundedRectangle(r, 5.f);
+        g.setColour(kGold.withAlpha(highlighted ? 0.95f : 0.45f));
+        g.drawRoundedRectangle(r, 5.f, 1.f);
+    }
+
+    juce::Font getTextButtonFont(juce::TextButton&, int) override
+    {
+        return juce::Font(juce::FontOptions(11.f, juce::Font::bold));
+    }
+
+    void drawComboBox(juce::Graphics& g, int w, int h, bool, int, int, int, int, juce::ComboBox&) override
+    {
+        auto r = juce::Rectangle<float>(0.f, 0.f, (float) w, (float) h).reduced(0.5f);
+        g.setGradientFill(juce::ColourGradient(juce::Colour(0xff262626), 0.f, 0.f,
+                                               juce::Colour(0xff0b0b0b), 0.f, (float) h, false));
+        g.fillRoundedRectangle(r, 5.f);
+        g.setColour(kGold.withAlpha(0.5f));
+        g.drawRoundedRectangle(r, 5.f, 1.f);
+        juce::Path a;
+        a.addTriangle((float) w - 19.f, (float) h * 0.5f - 3.f, (float) w - 9.f, (float) h * 0.5f - 3.f,
+                      (float) w - 14.f, (float) h * 0.5f + 3.f);
+        g.setColour(kGold);
+        g.fillPath(a);
     }
 };
 
@@ -305,36 +470,62 @@ class BlackTuneEditor : public juce::AudioProcessorEditor, private juce::Timer
 public:
     explicit BlackTuneEditor(BlackTune& p) : AudioProcessorEditor(&p), proc(p)
     {
-        setSize(760, 480);
+        setSize(800, 520);
         setLookAndFeel(&laf);
 
-        const char* ids[5]   = { "retune", "amount", "robot", "grit", "mix" };
-        const char* names[5] = { "RETUNE SPEED", "AMOUNT", "ROBOT", "GRIT", "MIX" };
-        for (int i = 0; i < 5; ++i)
+        const char* ids[6]   = { "retune", "amount", "robot", "grit", "mix", "output" };
+        const char* names[6] = { "RETUNE SPEED", "AMOUNT", "ROBOT", "GRIT", "MIX", "OUTPUT" };
+        for (int i = 0; i < 6; ++i)
         {
             auto& k = knobs[(size_t) i];
             k.s.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
-            k.s.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 80, 18);
+            k.s.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 90, 18);
             k.s.setRotaryParameters(juce::MathConstants<float>::pi * 1.2f,
                                     juce::MathConstants<float>::pi * 2.8f, true);
-            k.s.setColour(juce::Slider::textBoxTextColourId, juce::Colours::white);
+            k.s.setColour(juce::Slider::textBoxTextColourId, juce::Colour(0xffe8e8e8));
             k.s.setColour(juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
-            if (i == 0) k.s.setTextValueSuffix(" ms");
             addAndMakeVisible(k.s);
 
             k.l.setText(names[i], juce::dontSendNotification);
             k.l.setJustificationType(juce::Justification::centred);
-            k.l.setColour(juce::Label::textColourId, i == 0 ? juce::Colour(0xffe02020) : juce::Colour(0xffcccccc));
-            k.l.setFont(juce::Font(juce::FontOptions(14.f, juce::Font::bold)));
+            k.l.setColour(juce::Label::textColourId, i == 0 ? kGold : juce::Colour(0xffbdbdbd));
+            k.l.setFont(juce::Font(juce::FontOptions(13.f, juce::Font::bold)));
             addAndMakeVisible(k.l);
 
             k.a = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(proc.apvts, ids[i], k.s);
+
+            if (i == 0)
+            {
+                k.s.textFromValueFunction = [](double v) { return juce::String(v, 1) + " ms"; };
+                k.s.valueFromTextFunction = [](const juce::String& t) { return t.getDoubleValue(); };
+            }
+            else if (i == 5)
+            {
+                k.s.textFromValueFunction = [](double v) { return juce::String(v, 1) + " dB"; };
+                k.s.valueFromTextFunction = [](const juce::String& t) { return t.getDoubleValue(); };
+            }
+            else
+            {
+                k.s.textFromValueFunction = [](double v) { return juce::String((int) std::round(v * 100.0)) + " %"; };
+                k.s.valueFromTextFunction = [](const juce::String& t) { return t.getDoubleValue() / 100.0; };
+            }
+            k.s.updateText();
         }
 
         setupCombo(keyBox, keyNames());
         setupCombo(scaleBox, scaleNames());
         keyA = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(proc.apvts, "key", keyBox);
         scaleA = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(proc.apvts, "scale", scaleBox);
+
+        const char* pn[5] = { "HARD TUNE", "ROBOT", "CLEAN", "NATURAL", "DESTROY" };
+        for (int i = 0; i < 5; ++i)
+        {
+            presets[(size_t) i].setButtonText(pn[i]);
+            presets[(size_t) i].setColour(juce::TextButton::textColourOffId, kGold);
+            presets[(size_t) i].setColour(juce::TextButton::textColourOnId, kGold);
+            presets[(size_t) i].onClick = [this, i] { applyPreset(i); };
+            addAndMakeVisible(presets[(size_t) i]);
+        }
 
         startTimerHz(30);
     }
@@ -343,41 +534,46 @@ public:
 
     void resized() override
     {
-        for (int i = 0; i < 5; ++i)
+        for (int i = 0; i < 6; ++i)
         {
-            juce::Rectangle<int> col(20 + i * 144, 330, 144, 140);
-            knobs[(size_t) i].l.setBounds(col.removeFromTop(18));
+            juce::Rectangle<int> col(20 + i * 127, 378, 127, 130);
+            knobs[(size_t) i].l.setBounds(col.removeFromTop(20));
             knobs[(size_t) i].s.setBounds(col);
         }
-        keyBox.setBounds(60, 290, 90, 28);
-        scaleBox.setBounds(235, 290, 180, 28);
+        keyBox.setBounds(64, 332, 88, 28);
+        scaleBox.setBounds(236, 332, 176, 28);
+        for (int i = 0; i < 5; ++i)
+            presets[(size_t) i].setBounds(434 + i * 68, 332, 64, 28);
     }
 
     void paint(juce::Graphics& g) override
     {
-        g.setGradientFill(juce::ColourGradient(juce::Colour(0xff1d1d1d), 0.f, 0.f,
-                                               juce::Colour(0xff050505), 0.f, (float) getHeight(), false));
+        const int W = getWidth(), H = getHeight();
+
+        // background: carbon gradient, brushed lines, vignette
+        g.setGradientFill(juce::ColourGradient(juce::Colour(0xff202020), 0.f, 0.f,
+                                               juce::Colour(0xff060606), 0.f, (float) H, false));
+        g.fillAll();
+        g.setColour(juce::Colours::white.withAlpha(0.018f));
+        for (int y = 0; y < H; y += 3) g.drawHorizontalLine(y, 0.f, (float) W);
+        g.setGradientFill(juce::ColourGradient(juce::Colours::transparentBlack, (float) W * 0.5f, (float) H * 0.5f,
+                                               juce::Colours::black.withAlpha(0.55f), 0.f, 0.f, true));
         g.fillAll();
 
-        // header
-        g.setColour(juce::Colour(0xff0a0a0a));
-        g.fillRect(0, 0, getWidth(), 64);
-        g.setColour(juce::Colour(0xffe02020));
-        g.fillRect(0, 62, getWidth(), 2);
-        g.setColour(juce::Colours::white);
-        g.setFont(juce::Font(juce::FontOptions(34.f, juce::Font::bold)));
-        g.drawText("BLACK TUNE RECORD", 20, 0, 520, 64, juce::Justification::centredLeft);
-        g.setColour(juce::Colour(0xff999999));
-        g.setFont(juce::Font(juce::FontOptions(13.f, juce::Font::plain)));
-        g.drawText("AGGRESSIVE PITCH CORRECTION", 440, 0, 300, 64, juce::Justification::centredRight);
+        drawHeader(g, W);
+
+        drawPanel(g, meterPanel);
+        drawPanel(g, kbPanel);
+        drawPanel(g, stripPanel);
+        drawPanel(g, knobPanel);
 
         drawMeter(g);
         drawKeyboard(g);
 
-        g.setColour(juce::Colour(0xffcccccc));
-        g.setFont(juce::Font(juce::FontOptions(14.f, juce::Font::bold)));
-        g.drawText("KEY", 20, 290, 40, 28, juce::Justification::centredLeft);
-        g.drawText("SCALE", 170, 290, 60, 28, juce::Justification::centredLeft);
+        g.setColour(juce::Colour(0xffbdbdbd));
+        g.setFont(juce::Font(juce::FontOptions(13.f, juce::Font::bold)));
+        g.drawText("KEY", 32, 332, 32, 28, juce::Justification::centredLeft);
+        g.drawText("SCALE", 172, 332, 62, 28, juce::Justification::centredLeft);
     }
 
 private:
@@ -390,23 +586,42 @@ private:
         juce::Label l;
         std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> a;
     };
-    std::array<Knob, 5> knobs;
+    std::array<Knob, 6> knobs;
     juce::ComboBox keyBox, scaleBox;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> keyA, scaleA;
+    std::array<juce::TextButton, 5> presets;
 
-    const juce::Rectangle<int> meterArea { 20, 76, 720, 110 };
-    const juce::Rectangle<int> kbArea { 20, 198, 720, 80 };
+    const juce::Rectangle<int> meterPanel { 20, 84, 760, 130 };
+    const juce::Rectangle<int> kbPanel { 20, 224, 760, 94 };
+    const juce::Rectangle<int> stripPanel { 20, 326, 760, 40 };
+    const juce::Rectangle<int> knobPanel { 20, 374, 760, 136 };
 
-    void timerCallback() override { repaint(meterArea.getUnion(kbArea)); }
+    void timerCallback() override { repaint(meterPanel.getUnion(kbPanel)); }
 
     void setupCombo(juce::ComboBox& box, const juce::StringArray& items)
     {
         box.addItemList(items, 1);
-        box.setColour(juce::ComboBox::backgroundColourId, juce::Colour(0xff151515));
         box.setColour(juce::ComboBox::textColourId, juce::Colours::white);
-        box.setColour(juce::ComboBox::outlineColourId, juce::Colour(0xffe02020));
-        box.setColour(juce::ComboBox::arrowColourId, juce::Colour(0xfff5c542));
         addAndMakeVisible(box);
+    }
+
+    void applyPreset(int idx)
+    {
+        static const float P[5][5] = {
+            { 0.f,  1.f,  0.25f, 0.f,   1.f },   // HARD TUNE
+            { 0.f,  1.f,  0.75f, 0.15f, 1.f },   // ROBOT
+            { 15.f, 1.f,  0.f,   0.f,   1.f },   // CLEAN
+            { 60.f, 0.8f, 0.f,   0.f,   1.f },   // NATURAL
+            { 0.f,  1.f,  0.9f,  0.6f,  1.f }    // DESTROY
+        };
+        const char* ids[5] = { "retune", "amount", "robot", "grit", "mix" };
+        for (int i = 0; i < 5; ++i)
+            if (auto* prm = proc.apvts.getParameter(ids[i]))
+            {
+                prm->beginChangeGesture();
+                prm->setValueNotifyingHost(prm->convertTo0to1(P[idx][i]));
+                prm->endChangeGesture();
+            }
     }
 
     static juce::String noteName(int midiNote)
@@ -414,54 +629,152 @@ private:
         return keyNames()[((midiNote % 12) + 12) % 12];
     }
 
+    void drawPanel(juce::Graphics& g, juce::Rectangle<int> r)
+    {
+        auto f = r.toFloat();
+        g.setGradientFill(juce::ColourGradient(juce::Colour(0xff1b1b1b), f.getX(), f.getY(),
+                                               juce::Colour(0xff090909), f.getX(), f.getBottom(), false));
+        g.fillRoundedRectangle(f, 10.f);
+        g.setColour(kGold.withAlpha(0.28f));
+        g.drawRoundedRectangle(f.reduced(0.5f), 10.f, 1.f);
+        g.setColour(juce::Colours::white.withAlpha(0.06f));
+        g.drawLine(f.getX() + 10.f, f.getY() + 1.5f, f.getRight() - 10.f, f.getY() + 1.5f);
+    }
+
+    void drawHeader(juce::Graphics& g, int W)
+    {
+        g.setGradientFill(juce::ColourGradient(juce::Colour(0xff141414), 0.f, 0.f,
+                                               juce::Colour(0xff050505), 0.f, 68.f, false));
+        g.fillRect(0, 0, W, 68);
+
+        juce::ColourGradient line(kGold.withAlpha(0.f), 0.f, 0.f, kGold.withAlpha(0.f), (float) W, 0.f, false);
+        line.addColour(0.5, kGold);
+        g.setGradientFill(line);
+        g.fillRect(0, 68, W, 2);
+
+        // vinyl record logo
+        const float cx = 46.f, cy = 35.f, R = 24.f;
+        g.setColour(kGold.withAlpha(0.25f));
+        g.fillEllipse(cx - R - 3.f, cy - R - 3.f, 2.f * R + 6.f, 2.f * R + 6.f);
+        g.setGradientFill(juce::ColourGradient(juce::Colour(0xff2f2f2f), cx - R * 0.5f, cy - R * 0.5f,
+                                               juce::Colour(0xff040404), cx + R, cy + R, true));
+        g.fillEllipse(cx - R, cy - R, 2.f * R, 2.f * R);
+        for (int i = 1; i <= 5; ++i)
+        {
+            const float rr = R - 2.f - (float) i * 3.2f;
+            g.setColour(juce::Colours::white.withAlpha(0.07f));
+            g.drawEllipse(cx - rr, cy - rr, 2.f * rr, 2.f * rr, 1.f);
+        }
+        g.setColour(kRed);
+        g.fillEllipse(cx - 8.f, cy - 8.f, 16.f, 16.f);
+        g.setColour(kGold);
+        g.fillEllipse(cx - 2.5f, cy - 2.5f, 5.f, 5.f);
+
+        g.setGradientFill(juce::ColourGradient(juce::Colours::white, 0.f, 16.f, kGold, 0.f, 52.f, false));
+        g.setFont(juce::Font(juce::FontOptions(32.f, juce::Font::bold)));
+        g.drawText("BLACK TUNE RECORD", 84, 0, 480, 68, juce::Justification::centredLeft);
+
+        g.setColour(juce::Colour(0xff9a9a9a));
+        g.setFont(juce::Font(juce::FontOptions(12.f, juce::Font::bold)));
+        g.drawText("AGGRESSIVE PITCH CORRECTION", W - 320, 0, 300, 68, juce::Justification::centredRight);
+    }
+
     void drawMeter(juce::Graphics& g)
     {
-        auto r = meterArea.toFloat();
-        g.setColour(juce::Colour(0xff0d0d0d));
-        g.fillRoundedRectangle(r, 8.f);
-        g.setColour(juce::Colour(0xff333333));
-        g.drawRoundedRectangle(r, 8.f, 1.5f);
-
+        auto r = meterPanel.toFloat();
         const bool voiced = proc.meterVoiced.load();
         const float det = proc.meterDetected.load();
         const float tgt = proc.meterTarget.load();
+        const float devCents = voiced ? juce::jlimit(-50.f, 50.f, (det - tgt) * 100.f) : 0.f;
 
-        g.setColour(voiced ? juce::Colour(0xfff5c542) : juce::Colour(0xff555555));
-        g.setFont(juce::Font(juce::FontOptions(64.f, juce::Font::bold)));
-        g.drawText(voiced ? noteName((int) std::round(tgt)) : "--",
-                   (int) r.getX() + 10, (int) r.getY(), 170, (int) r.getHeight(),
-                   juce::Justification::centred);
+        // big note with glow
+        g.setColour(juce::Colour(0xff777777));
+        g.setFont(juce::Font(juce::FontOptions(11.f, juce::Font::bold)));
+        g.drawText("TARGET NOTE", (int) r.getX() + 18, (int) r.getY() + 10, 160, 14, juce::Justification::left);
 
-        auto bar = juce::Rectangle<float>(220.f, r.getCentreY() - 14.f, 480.f, 28.f);
-        g.setColour(juce::Colour(0xff050505));
-        g.fillRoundedRectangle(bar, 4.f);
-        g.setColour(juce::Colour(0xff444444));
-        g.drawRoundedRectangle(bar, 4.f, 1.f);
-
-        for (int cents = -50; cents <= 50; cents += 25)
+        const juce::String nt = voiced ? noteName((int) std::round(tgt)) : "--";
+        g.setFont(juce::Font(juce::FontOptions(70.f, juce::Font::bold)));
+        const juce::Rectangle<int> nr((int) r.getX() + 10, (int) r.getY() + 18, 180, 80);
+        if (voiced)
         {
-            const float x = bar.getCentreX() + (float) cents / 50.f * bar.getWidth() * 0.5f;
-            g.setColour(cents == 0 ? juce::Colour(0xff39d353) : juce::Colour(0xff555555));
-            g.drawLine(x, bar.getY() + 3.f, x, bar.getBottom() - 3.f, cents == 0 ? 2.f : 1.f);
+            g.setColour(kGold.withAlpha(0.14f));
+            for (int dx = -3; dx <= 3; dx += 3)
+                for (int dy = -3; dy <= 3; dy += 3)
+                    g.drawText(nt, nr.translated(dx, dy), juce::Justification::centred);
         }
+        g.setColour(voiced ? kGold : juce::Colour(0xff4a4a4a));
+        g.drawText(nt, nr, juce::Justification::centred);
 
-        g.setColour(juce::Colour(0xff888888));
-        g.setFont(juce::Font(juce::FontOptions(11.f, juce::Font::plain)));
-        g.drawText("FLAT", (int) bar.getX(), (int) bar.getBottom() + 4, 60, 14, juce::Justification::left);
-        g.drawText("SHARP", (int) bar.getRight() - 60, (int) bar.getBottom() + 4, 60, 14, juce::Justification::right);
+        juce::String status = "NO SIGNAL";
+        juce::Colour statusCol(0xff555555);
+        if (voiced)
+        {
+            if (std::abs(devCents) <= 8.f) { status = "LOCKED"; statusCol = juce::Colour(0xff39d353); }
+            else if (devCents > 0.f)       { status = "SHARP";  statusCol = kRed; }
+            else                           { status = "FLAT";   statusCol = kRed; }
+        }
+        g.setColour(statusCol);
+        g.setFont(juce::Font(juce::FontOptions(12.f, juce::Font::bold)));
+        g.drawText(status, (int) r.getX() + 10, (int) r.getY() + 100, 180, 18, juce::Justification::centred);
+
+        // LED tuner bar
+        const float bx = r.getX() + 215.f, bw = 460.f, by = r.getY() + 50.f, bh = 32.f;
+        const int segs = 41;
+        const float segW = bw / (float) segs;
+        const int centerIdx = segs / 2;
+        const int devIdx = centerIdx + (int) std::round(devCents / 2.5f);
+        for (int i = 0; i < segs; ++i)
+        {
+            const float cents = (float) (i - centerIdx) * 2.5f;
+            juce::Colour on = std::abs(cents) <= 10.f ? juce::Colour(0xff39d353)
+                            : std::abs(cents) <= 25.f ? kGold : kRed;
+            bool lit = false;
+            if (voiced)
+            {
+                const int lo = juce::jmin(centerIdx, devIdx), hi = juce::jmax(centerIdx, devIdx);
+                lit = (i >= lo && i <= hi);
+            }
+            auto seg = juce::Rectangle<float>(bx + (float) i * segW + 1.f, by, segW - 2.f, bh);
+            if (lit)
+            {
+                g.setColour(on.withAlpha(0.22f));
+                g.fillRoundedRectangle(seg.expanded(1.5f), 3.f);
+                g.setColour(on);
+            }
+            else
+                g.setColour(i == centerIdx ? juce::Colour(0xff3a3a3a) : juce::Colour(0xff191919));
+            g.fillRoundedRectangle(seg, 2.f);
+        }
+        g.setColour(juce::Colour(0xff777777));
+        g.setFont(juce::Font(juce::FontOptions(11.f, juce::Font::bold)));
+        g.drawText("-50", (int) bx - 10, (int) (by + bh + 6.f), 40, 14, juce::Justification::left);
+        g.drawText("0", (int) (bx + bw * 0.5f) - 20, (int) (by + bh + 6.f), 40, 14, juce::Justification::centred);
+        g.drawText("+50", (int) (bx + bw) - 30, (int) (by + bh + 6.f), 40, 14, juce::Justification::right);
+        g.drawText("CENTS", (int) bx, (int) r.getY() + 12, 100, 14, juce::Justification::left);
 
         if (voiced)
         {
-            const float dev = juce::jlimit(-50.f, 50.f, (det - tgt) * 100.f);
-            const float x = bar.getCentreX() + dev / 50.f * bar.getWidth() * 0.5f;
-            g.setColour(juce::Colour(0xffe02020));
-            g.fillRoundedRectangle(x - 3.f, bar.getY() - 5.f, 6.f, bar.getHeight() + 10.f, 2.f);
             g.setColour(juce::Colours::white);
-            g.setFont(juce::Font(juce::FontOptions(13.f, juce::Font::bold)));
+            g.setFont(juce::Font(juce::FontOptions(14.f, juce::Font::bold)));
             g.drawText(juce::String((int) std::round((det - tgt) * 100.f)) + " cents",
-                       (int) bar.getX(), (int) bar.getY() - 22, (int) bar.getWidth(), 16,
-                       juce::Justification::centred);
+                       (int) bx, (int) r.getY() + 26, (int) bw, 18, juce::Justification::centred);
         }
+
+        // output level meter
+        const float lvx = r.getRight() - 52.f;
+        const float db = juce::Decibels::gainToDecibels(proc.outLevel.load(), -60.f);
+        const int lit = (int) std::round(juce::jmap(db, -60.f, 0.f, 0.f, 14.f));
+        const float segH = 6.f;
+        for (int i = 0; i < 14; ++i)
+        {
+            juce::Colour on = i < 9 ? juce::Colour(0xff39d353) : i < 12 ? kGold : kRed;
+            auto seg = juce::Rectangle<float>(lvx, r.getY() + 18.f + (float) (13 - i) * (segH + 1.5f), 20.f, segH);
+            g.setColour(i < lit ? on : juce::Colour(0xff191919));
+            g.fillRoundedRectangle(seg, 1.5f);
+        }
+        g.setColour(juce::Colour(0xff777777));
+        g.setFont(juce::Font(juce::FontOptions(11.f, juce::Font::bold)));
+        g.drawText("OUT", (int) lvx - 10, (int) r.getBottom() - 22, 40, 14, juce::Justification::centred);
     }
 
     void drawKeyboard(juce::Graphics& g)
@@ -473,7 +786,7 @@ private:
 
         auto allowed = [&](int note) { return ((mask >> (((note - key) % 12 + 12) % 12)) & 1) != 0; };
 
-        const auto r = kbArea.toFloat();
+        const auto r = kbPanel.reduced(12, 9).toFloat();
         const float w = r.getWidth() / 7.f;
         static const int whites[7] = { 0, 2, 4, 5, 7, 9, 11 };
 
@@ -481,10 +794,19 @@ private:
         {
             const int note = whites[i];
             auto kr = juce::Rectangle<float>(r.getX() + (float) i * w, r.getY(), w, r.getHeight()).reduced(1.5f);
-            g.setColour(note == targetNote ? juce::Colour(0xfff5c542)
-                        : allowed(note) ? juce::Colour(0xffeeeeee) : juce::Colour(0xff3a3a3a));
-            g.fillRoundedRectangle(kr, 3.f);
-            g.setColour(note == targetNote || allowed(note) ? juce::Colours::black : juce::Colour(0xff888888));
+            const bool isT = (note == targetNote);
+            if (isT)
+            {
+                g.setColour(kGold.withAlpha(0.28f));
+                g.fillRoundedRectangle(kr.expanded(3.f), 6.f);
+            }
+            juce::Colour top = isT ? juce::Colour(0xffffe27a) : allowed(note) ? juce::Colour(0xfff7f7f7) : juce::Colour(0xff3d3d3d);
+            juce::Colour bot = isT ? juce::Colour(0xffd49b12) : allowed(note) ? juce::Colour(0xffc4c4c4) : juce::Colour(0xff1d1d1d);
+            g.setGradientFill(juce::ColourGradient(top, 0.f, kr.getY(), bot, 0.f, kr.getBottom(), false));
+            g.fillRoundedRectangle(kr, 4.f);
+            g.setColour(juce::Colours::black.withAlpha(0.6f));
+            g.drawRoundedRectangle(kr, 4.f, 1.f);
+            g.setColour(isT || allowed(note) ? juce::Colours::black.withAlpha(0.8f) : juce::Colour(0xff8a8a8a));
             g.setFont(juce::Font(juce::FontOptions(12.f, juce::Font::bold)));
             g.drawText(noteName(note), kr.toNearestInt().removeFromBottom(18), juce::Justification::centred);
         }
@@ -497,11 +819,20 @@ private:
         {
             const int note = blacks[i];
             auto kr = juce::Rectangle<float>(r.getX() + (float) (after[i] + 1) * w - bw * 0.5f, r.getY(), bw, bh);
-            g.setColour(note == targetNote ? juce::Colour(0xfff5c542)
-                        : allowed(note) ? juce::Colour(0xffd01818) : juce::Colour(0xff0b0b0b));
+            const bool isT = (note == targetNote);
+            if (isT)
+            {
+                g.setColour(kGold.withAlpha(0.3f));
+                g.fillRoundedRectangle(kr.expanded(3.f), 5.f);
+            }
+            juce::Colour top = isT ? juce::Colour(0xffffe27a) : allowed(note) ? juce::Colour(0xffec3535) : juce::Colour(0xff222222);
+            juce::Colour bot = isT ? juce::Colour(0xffd49b12) : allowed(note) ? juce::Colour(0xff7d0d0d) : juce::Colour(0xff050505);
+            g.setGradientFill(juce::ColourGradient(top, 0.f, kr.getY(), bot, 0.f, kr.getBottom(), false));
             g.fillRoundedRectangle(kr, 3.f);
-            g.setColour(juce::Colour(0xff000000));
+            g.setColour(juce::Colours::black);
             g.drawRoundedRectangle(kr, 3.f, 1.f);
+            g.setColour(juce::Colours::white.withAlpha(0.18f));
+            g.drawLine(kr.getX() + 3.f, kr.getY() + 3.f, kr.getRight() - 3.f, kr.getY() + 3.f, 1.f);
         }
     }
 
