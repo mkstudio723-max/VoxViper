@@ -1,4 +1,4 @@
-// BLACK TUNE RECORD v3
+// BLACK TUNE RECORD v4 (+ Fresh Air, 4-band EQ with low cut)
 // - YIN pitch tracking with median filter, hysteresis and hold (precise, no flicker)
 // - PSOLA engine: output pitch set directly from the target note (exact), formants kept
 // - Premium custom GUI: LED tuner, glossy keyboard, metal knobs, presets
@@ -31,6 +31,60 @@ static float softClip(float x)
     const float s = 0.9f + 0.1f * std::tanh((a - 0.9f) / 0.1f);
     return x < 0.f ? -s : s;
 }
+
+//==============================================================================
+// RBJ biquad (double precision, per-channel state)
+struct Biquad
+{
+    double b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0;
+    double z1[2] = { 0, 0 }, z2[2] = { 0, 0 };
+
+    void reset() { z1[0] = z1[1] = z2[0] = z2[1] = 0.0; }
+
+    float process(int ch, float xf)
+    {
+        const double x = (double) xf;
+        const double y = b0 * x + z1[ch];
+        z1[ch] = b1 * x - a1 * y + z2[ch];
+        z2[ch] = b2 * x - a2 * y;
+        return (float) y;
+    }
+
+    void set(double B0, double B1, double B2, double A0, double A1, double A2)
+    {
+        b0 = B0 / A0; b1 = B1 / A0; b2 = B2 / A0; a1 = A1 / A0; a2 = A2 / A0;
+    }
+
+    static double clampF(double sr, double f) { return std::min(std::max(f, 10.0), 0.45 * sr); }
+
+    void setHighPass(double sr, double f, double Q)
+    {
+        const double w = 6.283185307179586 * clampF(sr, f) / sr, c = std::cos(w), al = std::sin(w) / (2.0 * Q);
+        set((1 + c) / 2, -(1 + c), (1 + c) / 2, 1 + al, -2 * c, 1 - al);
+    }
+    void setPeak(double sr, double f, double Q, double dB)
+    {
+        const double A = std::pow(10.0, dB / 40.0);
+        const double w = 6.283185307179586 * clampF(sr, f) / sr, c = std::cos(w), al = std::sin(w) / (2.0 * Q);
+        set(1 + al * A, -2 * c, 1 - al * A, 1 + al / A, -2 * c, 1 - al / A);
+    }
+    void setLowShelf(double sr, double f, double dB)
+    {
+        const double A = std::pow(10.0, dB / 40.0);
+        const double w = 6.283185307179586 * clampF(sr, f) / sr, c = std::cos(w), s = std::sin(w);
+        const double beta = 2.0 * std::sqrt(A) * (s / 2.0 * std::sqrt(2.0));
+        set(A * ((A + 1) - (A - 1) * c + beta), 2 * A * ((A - 1) - (A + 1) * c), A * ((A + 1) - (A - 1) * c - beta),
+            (A + 1) + (A - 1) * c + beta, -2 * ((A - 1) + (A + 1) * c), (A + 1) + (A - 1) * c - beta);
+    }
+    void setHighShelf(double sr, double f, double dB)
+    {
+        const double A = std::pow(10.0, dB / 40.0);
+        const double w = 6.283185307179586 * clampF(sr, f) / sr, c = std::cos(w), s = std::sin(w);
+        const double beta = 2.0 * std::sqrt(A) * (s / 2.0 * std::sqrt(2.0));
+        set(A * ((A + 1) + (A - 1) * c + beta), -2 * A * ((A - 1) + (A + 1) * c), A * ((A + 1) + (A - 1) * c - beta),
+            (A + 1) - (A - 1) * c + beta, 2 * ((A - 1) - (A + 1) * c), (A + 1) - (A - 1) * c - beta);
+    }
+};
 
 //==============================================================================
 class BlackTune : public juce::AudioProcessor
@@ -100,6 +154,10 @@ public:
         snapOn = false;
         histN = 0; histIdx = 0; unvoicedHops = 0; curNote = -1;
         meterVoiced = false;
+        for (Biquad* b : { &eqHP, &eqLow, &eqLoMid, &eqHiMid, &eqHigh, &airHP, &airOutHP, &airShelf }) b->reset();
+        airEnv[0] = airEnv[1] = 0.f;
+        prevEqOn = prevAirOn = false;
+        eqFade = airFade = 0.f;
     }
     void releaseResources() override {}
 
@@ -132,6 +190,43 @@ public:
         const float combNorm = 1.f / (1.f + fb * 0.6f);
         const float outGain = juce::Decibels::decibelsToGain(outDb);
 
+        // ---- extra modules ----
+        const bool eqOn   = *apvts.getRawParameterValue("eq_on") > 0.5f;
+        const bool airOn  = *apvts.getRawParameterValue("air_on") > 0.5f;
+        const float airAmt  = *apvts.getRawParameterValue("air_amount");
+        const float airFreq = *apvts.getRawParameterValue("air_freq");
+        const float lowCut  = *apvts.getRawParameterValue("eq_lowcut");
+        const float gLow    = *apvts.getRawParameterValue("eq_low");
+        const float gLoMid  = *apvts.getRawParameterValue("eq_lomid");
+        const float gHiMid  = *apvts.getRawParameterValue("eq_himid");
+        const float gHigh   = *apvts.getRawParameterValue("eq_high");
+        const bool eqUseHP = lowCut > 20.5f;
+        if (eqOn && !prevEqOn)
+            for (Biquad* b : { &eqHP, &eqLow, &eqLoMid, &eqHiMid, &eqHigh }) b->reset();
+        if (airOn && !prevAirOn)
+        {
+            for (Biquad* b : { &airHP, &airOutHP, &airShelf }) b->reset();
+            airEnv[0] = airEnv[1] = 0.f;
+        }
+        if (eqOn || eqFade > 0.0005f)
+        {
+            eqHP.setHighPass(sr, (double) lowCut, 0.7071);
+            eqLow.setLowShelf(sr, 120.0, (double) gLow);
+            eqLoMid.setPeak(sr, 350.0, 0.9, (double) gLoMid);
+            eqHiMid.setPeak(sr, 3500.0, 0.9, (double) gHiMid);
+            eqHigh.setHighShelf(sr, 8000.0, (double) gHigh);
+        }
+        if (airOn || airFade > 0.0005f)
+        {
+            airHP.setHighPass(sr, (double) airFreq, 0.7071);
+            airOutHP.setHighPass(sr, (double) airFreq, 0.7071);
+            airShelf.setHighShelf(sr, (double) airFreq * 0.8, (double) airAmt * 6.0);
+        }
+        prevEqOn = eqOn;
+        prevAirOn = airOn;
+        const float envCoef = 1.f - std::exp(-1.f / (0.004f * (float) sr));
+        const float fadeCoef = 1.f - std::exp(-1.f / (0.005f * (float) sr));
+
         float pk = 0.f;
 
         for (int i = 0; i < n; ++i)
@@ -155,6 +250,9 @@ public:
 
             generateGrains(nCh);
 
+            eqFade  += fadeCoef * ((eqOn  ? 1.f : 0.f) - eqFade);
+            airFade += fadeCoef * ((airOn ? 1.f : 0.f) - airFade);
+
             combT += 0.002f * ((float) (sr / (double) outFreq) - combT);
             combT = juce::jlimit(8.f, (float) (kBuf - 4), combT);
 
@@ -176,8 +274,32 @@ public:
                 }
 
                 const float dry = dl[(size_t) c][(size_t) ((wp - delay0) & kMask)];
-                float out = (dry * (1.f - mix) + wet * mix) * outGain;
-                out = softClip(out);
+                float out = dry * (1.f - mix) + wet * mix;
+
+                if (eqFade > 0.0005f)
+                {
+                    float y = out;
+                    if (eqUseHP) y = eqHP.process(c, y);
+                    y = eqLow.process(c, y);
+                    y = eqLoMid.process(c, y);
+                    y = eqHiMid.process(c, y);
+                    y = eqHigh.process(c, y);
+                    out += eqFade * (y - out);
+                }
+                if (airFade > 0.0005f)
+                {
+                    // Fresh Air: high shelf + level-following harmonic exciter on the top band
+                    const float band = airHP.process(c, out);
+                    const float a = std::abs(band);
+                    airEnv[c] += envCoef * (a - airEnv[c]);
+                    const float e = airEnv[c] + 1e-7f;
+                    const float sat = e * std::tanh(1.2f * band / e);
+                    const float exc = airOutHP.process(c, 0.5f * sat + (a - e));
+                    const float y = airShelf.process(c, out) + exc * airAmt * 0.8f;
+                    out += airFade * (y - out);
+                }
+
+                out = softClip(out * outGain);
                 io[i] = out;
                 pk = juce::jmax(pk, std::abs(out));
             }
@@ -210,6 +332,12 @@ private:
     int histN = 0, histIdx = 0, unvoicedHops = 0, curNote = -1;
     std::array<std::vector<float>, 2> dl, outB, comb;
     std::vector<float> det, lp, scratch, yin;
+
+    // extra modules: 4-band EQ (+ low cut) and Fresh Air
+    Biquad eqHP, eqLow, eqLoMid, eqHiMid, eqHigh, airHP, airOutHP, airShelf;
+    float airEnv[2] = { 0.f, 0.f };
+    bool prevEqOn = false, prevAirOn = false;
+    float eqFade = 0.f, airFade = 0.f;   // smooth on/off so toggling never clicks
 
     float readAt(const std::vector<float>& b, double pos) const
     {
@@ -291,6 +419,24 @@ private:
         l.add(std::make_unique<AudioParameterFloat>(ParameterID{"mix", 1}, "Mix",
               NormalisableRange<float>(0.f, 1.f, 0.001f), 1.f));
         l.add(std::make_unique<AudioParameterFloat>(ParameterID{"output", 1}, "Output",
+              NormalisableRange<float>(-12.f, 12.f, 0.1f), 0.f));
+
+        l.add(std::make_unique<AudioParameterBool>(ParameterID{"air_on", 1}, "Fresh Air On", false));
+        l.add(std::make_unique<AudioParameterFloat>(ParameterID{"air_amount", 1}, "Air Amount",
+              NormalisableRange<float>(0.f, 1.f, 0.001f), 0.4f));
+        l.add(std::make_unique<AudioParameterFloat>(ParameterID{"air_freq", 1}, "Air Shine Frequency",
+              NormalisableRange<float>(3000.f, 12000.f, 1.f, 0.6f), 8000.f));
+
+        l.add(std::make_unique<AudioParameterBool>(ParameterID{"eq_on", 1}, "EQ On", false));
+        l.add(std::make_unique<AudioParameterFloat>(ParameterID{"eq_lowcut", 1}, "EQ Low Cut",
+              NormalisableRange<float>(20.f, 400.f, 1.f, 0.4f), 20.f));
+        l.add(std::make_unique<AudioParameterFloat>(ParameterID{"eq_low", 1}, "EQ Low",
+              NormalisableRange<float>(-12.f, 12.f, 0.1f), 0.f));
+        l.add(std::make_unique<AudioParameterFloat>(ParameterID{"eq_lomid", 1}, "EQ Low Mid",
+              NormalisableRange<float>(-12.f, 12.f, 0.1f), 0.f));
+        l.add(std::make_unique<AudioParameterFloat>(ParameterID{"eq_himid", 1}, "EQ High Mid",
+              NormalisableRange<float>(-12.f, 12.f, 0.1f), 0.f));
+        l.add(std::make_unique<AudioParameterFloat>(ParameterID{"eq_high", 1}, "EQ High",
               NormalisableRange<float>(-12.f, 12.f, 0.1f), 0.f));
         return l;
     }
@@ -506,6 +652,34 @@ public:
         return juce::Font(juce::FontOptions(11.f, juce::Font::bold));
     }
 
+    void drawToggleButton(juce::Graphics& g, juce::ToggleButton& b, bool highlighted, bool) override
+    {
+        auto r = b.getLocalBounds().toFloat().reduced(0.5f);
+        const bool on = b.getToggleState();
+        juce::Colour top = on ? juce::Colour(0xff2a3a2a) : juce::Colour(0xff2d2d2d);
+        juce::Colour bot(0xff0d0d0d);
+        if (highlighted) top = top.brighter(0.2f);
+        g.setGradientFill(juce::ColourGradient(top, 0.f, r.getY(), bot, 0.f, r.getBottom(), false));
+        g.fillRoundedRectangle(r, 5.f);
+        g.setColour((on ? juce::Colour(0xff39d353) : kGold).withAlpha(highlighted ? 0.95f : 0.55f));
+        g.drawRoundedRectangle(r, 5.f, 1.f);
+
+        auto led = juce::Rectangle<float>(r.getX() + 9.f, r.getCentreY() - 5.f, 10.f, 10.f);
+        if (on)
+        {
+            g.setColour(juce::Colour(0xff39d353).withAlpha(0.3f));
+            g.fillEllipse(led.expanded(4.f));
+        }
+        g.setColour(on ? juce::Colour(0xff39d353) : juce::Colour(0xff3a3a3a));
+        g.fillEllipse(led);
+        g.setColour(juce::Colours::black.withAlpha(0.7f));
+        g.drawEllipse(led, 1.f);
+
+        g.setColour(on ? juce::Colours::white : juce::Colour(0xff9a9a9a));
+        g.setFont(juce::Font(juce::FontOptions(12.f, juce::Font::bold)));
+        g.drawText(on ? "ON" : "OFF", r.withTrimmedLeft(24.f).toNearestInt(), juce::Justification::centred);
+    }
+
     void drawComboBox(juce::Graphics& g, int w, int h, bool, int, int, int, int, juce::ComboBox&) override
     {
         auto r = juce::Rectangle<float>(0.f, 0.f, (float) w, (float) h).reduced(0.5f);
@@ -528,7 +702,7 @@ class BlackTuneEditor : public juce::AudioProcessorEditor, private juce::Timer
 public:
     explicit BlackTuneEditor(BlackTune& p) : AudioProcessorEditor(&p), proc(p)
     {
-        setSize(800, 520);
+        setSize(800, 700);
         setLookAndFeel(&laf);
 
         const char* ids[6]   = { "retune", "amount", "robot", "grit", "mix", "output" };
@@ -575,6 +749,17 @@ public:
         keyA = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(proc.apvts, "key", keyBox);
         scaleA = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(proc.apvts, "scale", scaleBox);
 
+        const char* fxIds[7]   = { "air_amount", "air_freq", "eq_lowcut", "eq_low", "eq_lomid", "eq_himid", "eq_high" };
+        const char* fxNames[7] = { "AIR", "SHINE", "LOW CUT", "LOW", "LOW MID", "HIGH MID", "HIGH" };
+        const int fxKinds[7]   = { 0, 1, 2, 3, 3, 3, 3 };
+        for (int i = 0; i < 7; ++i)
+            setupFxKnob(fx[(size_t) i], fxIds[i], fxNames[i], fxKinds[i]);
+
+        addAndMakeVisible(airBtn);
+        addAndMakeVisible(eqBtn);
+        airA = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(proc.apvts, "air_on", airBtn);
+        eqA  = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(proc.apvts, "eq_on", eqBtn);
+
         const char* pn[5] = { "HARD TUNE", "ROBOT", "CLEAN", "NATURAL", "DESTROY" };
         for (int i = 0; i < 5; ++i)
         {
@@ -600,6 +785,21 @@ public:
         }
         keyBox.setBounds(64, 332, 88, 28);
         scaleBox.setBounds(236, 332, 176, 28);
+
+        for (int i = 0; i < 2; ++i)
+        {
+            juce::Rectangle<int> col(30 + i * 115, 556, 115, 126);
+            fx[(size_t) i].l.setBounds(col.removeFromTop(20));
+            fx[(size_t) i].s.setBounds(col);
+        }
+        for (int i = 0; i < 5; ++i)
+        {
+            juce::Rectangle<int> col(292 + i * 97, 556, 97, 126);
+            fx[(size_t) (2 + i)].l.setBounds(col.removeFromTop(20));
+            fx[(size_t) (2 + i)].s.setBounds(col);
+        }
+        airBtn.setBounds(196, 526, 68, 24);
+        eqBtn.setBounds(700, 526, 68, 24);
         for (int i = 0; i < 5; ++i)
             presets[(size_t) i].setBounds(434 + i * 68, 332, 64, 28);
     }
@@ -624,9 +824,20 @@ public:
         drawPanel(g, kbPanel);
         drawPanel(g, stripPanel);
         drawPanel(g, knobPanel);
+        drawPanel(g, fxPanel);
 
         drawMeter(g);
         drawKeyboard(g);
+
+        const bool airOnNow = *proc.apvts.getRawParameterValue("air_on") > 0.5f;
+        const bool eqOnNow  = *proc.apvts.getRawParameterValue("eq_on") > 0.5f;
+        g.setFont(juce::Font(juce::FontOptions(14.f, juce::Font::bold)));
+        g.setColour(airOnNow ? kGold : juce::Colour(0xff8a8a8a));
+        g.drawText("FRESH AIR", 34, 526, 150, 24, juce::Justification::centredLeft);
+        g.setColour(eqOnNow ? kGold : juce::Colour(0xff8a8a8a));
+        g.drawText("EQUALIZER", 300, 526, 200, 24, juce::Justification::centredLeft);
+        g.setColour(kGold.withAlpha(0.2f));
+        g.drawLine(281.f, 530.f, 281.f, 684.f, 1.f);
 
         g.setColour(juce::Colour(0xffbdbdbd));
         g.setFont(juce::Font(juce::FontOptions(13.f, juce::Font::bold)));
@@ -645,6 +856,10 @@ private:
         std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> a;
     };
     std::array<Knob, 6> knobs;
+    std::array<Knob, 7> fx;   // 0-1 Fresh Air, 2-6 EQ
+    juce::ToggleButton airBtn, eqBtn;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> airA, eqA;
+    int lastAir = -1, lastEq = -1;
     juce::ComboBox keyBox, scaleBox;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> keyA, scaleA;
     std::array<juce::TextButton, 5> presets;
@@ -653,8 +868,76 @@ private:
     const juce::Rectangle<int> kbPanel { 20, 224, 760, 94 };
     const juce::Rectangle<int> stripPanel { 20, 326, 760, 40 };
     const juce::Rectangle<int> knobPanel { 20, 374, 760, 136 };
+    const juce::Rectangle<int> fxPanel { 20, 518, 760, 172 };
 
-    void timerCallback() override { repaint(meterPanel.getUnion(kbPanel)); }
+    void timerCallback() override
+    {
+        repaint(meterPanel.getUnion(kbPanel));
+
+        const int airOn = *proc.apvts.getRawParameterValue("air_on") > 0.5f ? 1 : 0;
+        const int eqOn  = *proc.apvts.getRawParameterValue("eq_on") > 0.5f ? 1 : 0;
+        if (airOn != lastAir)
+        {
+            lastAir = airOn;
+            for (size_t i = 0; i < 2; ++i) setFxDim(fx[i], airOn == 1);
+            repaint(fxPanel);
+        }
+        if (eqOn != lastEq)
+        {
+            lastEq = eqOn;
+            for (size_t i = 2; i < 7; ++i) setFxDim(fx[i], eqOn == 1);
+            repaint(fxPanel);
+        }
+    }
+
+    static void setFxDim(Knob& k, bool on)
+    {
+        const float a = on ? 1.f : 0.4f;
+        k.s.setAlpha(a);
+        k.l.setAlpha(a);
+    }
+
+    // kind: 0 percent, 1 kHz, 2 low-cut Hz (OFF at minimum), 3 dB
+    void setupFxKnob(Knob& k, const char* id, const char* name, int kind)
+    {
+        k.s.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
+        k.s.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 88, 18);
+        k.s.setRotaryParameters(juce::MathConstants<float>::pi * 1.2f,
+                                juce::MathConstants<float>::pi * 2.8f, true);
+        k.s.setColour(juce::Slider::textBoxTextColourId, juce::Colour(0xffe8e8e8));
+        k.s.setColour(juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
+        addAndMakeVisible(k.s);
+
+        k.l.setText(name, juce::dontSendNotification);
+        k.l.setJustificationType(juce::Justification::centred);
+        k.l.setColour(juce::Label::textColourId, juce::Colour(0xffbdbdbd));
+        k.l.setFont(juce::Font(juce::FontOptions(12.f, juce::Font::bold)));
+        addAndMakeVisible(k.l);
+
+        k.a = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(proc.apvts, id, k.s);
+
+        if (kind == 0)
+        {
+            k.s.textFromValueFunction = [](double v) { return juce::String((int) std::round(v * 100.0)) + " %"; };
+            k.s.valueFromTextFunction = [](const juce::String& t) { return t.getDoubleValue() / 100.0; };
+        }
+        else if (kind == 1)
+        {
+            k.s.textFromValueFunction = [](double v) { return juce::String(v / 1000.0, 1) + " kHz"; };
+            k.s.valueFromTextFunction = [](const juce::String& t) { return t.getDoubleValue() * 1000.0; };
+        }
+        else if (kind == 2)
+        {
+            k.s.textFromValueFunction = [](double v) { return v <= 20.5 ? juce::String("OFF") : juce::String((int) std::round(v)) + " Hz"; };
+            k.s.valueFromTextFunction = [](const juce::String& t) { return t.getDoubleValue(); };
+        }
+        else
+        {
+            k.s.textFromValueFunction = [](double v) { return juce::String(v, 1) + " dB"; };
+            k.s.valueFromTextFunction = [](const juce::String& t) { return t.getDoubleValue(); };
+        }
+        k.s.updateText();
+    }
 
     void setupCombo(juce::ComboBox& box, const juce::StringArray& items)
     {
