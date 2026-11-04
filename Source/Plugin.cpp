@@ -1,12 +1,14 @@
-// BLACK TUNE RECORD v4 (+ Fresh Air, 4-band EQ with low cut)
-// - YIN pitch tracking with median filter, hysteresis and hold (precise, no flicker)
-// - PSOLA engine: output pitch set directly from the target note (exact), formants kept
-// - Premium custom GUI: LED tuner, glossy keyboard, metal knobs, presets
+// BLACK TUNE RECORD v5
+// Three independent tabs in one plugin: AUTO TUNE / FRESH AIR / EQUALIZER
+// - Auto Tune: YIN tracking + median + hysteresis, PSOLA engine with exact window normalisation
+// - Fresh Air: dynamic high-band lift + harmonic exciter with sibilance protection
+// - EQ: low cut, 4 bands with adjustable frequency, high cut, live response curve
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <complex>
 #include <utility>
 #include <vector>
 
@@ -31,6 +33,11 @@ static float softClip(float x)
     const float s = 0.9f + 0.1f * std::tanh((a - 0.9f) / 0.1f);
     return x < 0.f ? -s : s;
 }
+
+// parameter ids of the EQ and Fresh Air modules (order matters: used by processor and editor)
+static const char* const kEqIds[10] = { "eq_lowcut", "eq_low", "eq_low_f", "eq_lomid", "eq_lomid_f",
+                                        "eq_himid", "eq_himid_f", "eq_high", "eq_high_f", "eq_highcut" };
+static const char* const kAirIds[4] = { "air_amount", "air_freq", "air_sparkle", "air_smooth" };
 
 //==============================================================================
 // RBJ biquad (double precision, per-channel state)
@@ -62,6 +69,11 @@ struct Biquad
         const double w = 6.283185307179586 * clampF(sr, f) / sr, c = std::cos(w), al = std::sin(w) / (2.0 * Q);
         set((1 + c) / 2, -(1 + c), (1 + c) / 2, 1 + al, -2 * c, 1 - al);
     }
+    void setLowPass(double sr, double f, double Q)
+    {
+        const double w = 6.283185307179586 * clampF(sr, f) / sr, c = std::cos(w), al = std::sin(w) / (2.0 * Q);
+        set((1 - c) / 2, 1 - c, (1 - c) / 2, 1 + al, -2 * c, 1 - al);
+    }
     void setPeak(double sr, double f, double Q, double dB)
     {
         const double A = std::pow(10.0, dB / 40.0);
@@ -83,6 +95,13 @@ struct Biquad
         const double beta = 2.0 * std::sqrt(A) * (s / 2.0 * std::sqrt(2.0));
         set(A * ((A + 1) + (A - 1) * c + beta), -2 * A * ((A - 1) + (A + 1) * c), A * ((A + 1) + (A - 1) * c - beta),
             (A + 1) - (A - 1) * c + beta, 2 * ((A - 1) - (A + 1) * c), (A + 1) - (A - 1) * c - beta);
+    }
+
+    // complex frequency response at angular frequency w (radians/sample), used by the editor curves
+    std::complex<double> response(double w) const
+    {
+        const std::complex<double> e1 = std::polar(1.0, -w), e2 = std::polar(1.0, -2.0 * w);
+        return (b0 + b1 * e1 + b2 * e2) / (1.0 + a1 * e1 + a2 * e2);
     }
 };
 
@@ -137,6 +156,7 @@ public:
         for (auto& v : dl)   v.assign(kBuf, 0.f);
         for (auto& v : outB) v.assign(kBuf, 0.f);
         for (auto& v : comb) v.assign(kBuf, 0.f);
+        wsum.assign(kBuf, 0.f);
         det.assign(kBuf, 0.f);
         lp.assign(kBuf, 0.f);
         scratch.assign((size_t) kBuf, 0.f);
@@ -147,17 +167,21 @@ public:
         T0cur = (float) (sr / 200.0);
         curMidiOut = targetMidiOut = 69.f + 12.f * std::log2(200.f / 440.f);
         outFreq = 200.f;
-        nextTs = 0.0;
+        nextTs = sr / 90.0 + 8.0;                     // first grain never reaches negative time
         anaMark = nextTs - (double) delay0;
         combT = (float) (sr / 200.0);
-        lpState = 0.f;
+        combLP[0] = combLP[1] = 0.f;
+        lpState = 0.f; detLP = 0.f;
         snapOn = false;
         histN = 0; histIdx = 0; unvoicedHops = 0; curNote = -1;
         meterVoiced = false;
-        for (Biquad* b : { &eqHP, &eqLow, &eqLoMid, &eqHiMid, &eqHigh, &airHP, &airOutHP, &airShelf }) b->reset();
+
+        for (Biquad* b : { &eqHP, &eqLow, &eqLoMid, &eqHiMid, &eqHigh, &eqLP, &airHP, &airLP, &airOutHP, &airShelf }) b->reset();
         airEnv[0] = airEnv[1] = 0.f;
         prevEqOn = prevAirOn = false;
         eqFade = airFade = 0.f;
+        tuneFade = apvts.getRawParameterValue("tune_on")->load() > 0.5f ? 1.f : 0.f;
+        fxInit = false;
     }
     void releaseResources() override {}
 
@@ -167,21 +191,78 @@ public:
         const int nCh = juce::jmin(2, buf.getNumChannels());
         const int n = buf.getNumSamples();
 
-        const float amount = *apvts.getRawParameterValue("amount");
-        const float retMs  = *apvts.getRawParameterValue("retune");
-        const float robot  = *apvts.getRawParameterValue("robot");
-        const float grit   = *apvts.getRawParameterValue("grit");
-        const float mix    = *apvts.getRawParameterValue("mix");
-        const float outDb  = *apvts.getRawParameterValue("output");
-        keyIdx   = (int) *apvts.getRawParameterValue("key");
-        scaleIdx = (int) *apvts.getRawParameterValue("scale");
+        auto P = [this](const char* id) { return apvts.getRawParameterValue(id)->load(); };
+
+        // ---- AUTO TUNE parameters ----
+        const bool tuneOn = P("tune_on") > 0.5f;
+        const float amount = P("amount");
+        const float retMs  = P("retune");
+        const float robot  = P("robot");
+        const float grit   = P("grit");
+        const float mix    = P("mix");
+        const float outDb  = P("output");
+        keyIdx   = (int) P("key");
+        scaleIdx = (int) P("scale");
         amountP = amount;
+
+        // ---- EQ / FRESH AIR parameters (smoothed per block: no zipper noise) ----
+        const bool eqOn  = P("eq_on") > 0.5f;
+        const bool airOn = P("air_on") > 0.5f;
+        float eqT[10], airT[4];
+        for (int i = 0; i < 10; ++i) eqT[i] = P(kEqIds[i]);
+        for (int i = 0; i < 4; ++i)  airT[i] = P(kAirIds[i]);
+        if (!fxInit)
+        {
+            for (int i = 0; i < 10; ++i) eqS[i] = eqT[i];
+            for (int i = 0; i < 4; ++i)  airS[i] = airT[i];
+            fxInit = true;
+        }
+        else
+        {
+            const float sm = 1.f - std::exp(-(float) n / (0.03f * (float) sr));
+            for (int i = 0; i < 10; ++i) eqS[i] += sm * (eqT[i] - eqS[i]);
+            for (int i = 0; i < 4; ++i)  airS[i] += sm * (airT[i] - airS[i]);
+        }
+
+        if (eqOn && !prevEqOn)
+            for (Biquad* b : { &eqHP, &eqLow, &eqLoMid, &eqHiMid, &eqHigh, &eqLP }) b->reset();
+        if (airOn && !prevAirOn)
+        {
+            for (Biquad* b : { &airHP, &airLP, &airOutHP, &airShelf }) b->reset();
+            airEnv[0] = airEnv[1] = 0.f;
+        }
+        const bool eqUseHP = eqS[0] > 20.5f;
+        const bool eqUseLP = eqS[9] < 19900.f;
+        if (eqOn || eqFade > 0.0005f)
+        {
+            eqHP.setHighPass(sr, (double) eqS[0], 0.7071);
+            eqLow.setLowShelf(sr, (double) eqS[2], (double) eqS[1]);
+            eqLoMid.setPeak(sr, (double) eqS[4], 0.9, (double) eqS[3]);
+            eqHiMid.setPeak(sr, (double) eqS[6], 0.9, (double) eqS[5]);
+            eqHigh.setHighShelf(sr, (double) eqS[8], (double) eqS[7]);
+            eqLP.setLowPass(sr, (double) eqS[9], 0.7071);
+        }
+        const float sparkle = airS[2];
+        const float smoothAmt = airS[3];
+        if (airOn || airFade > 0.0005f)
+        {
+            airHP.setHighPass(sr, (double) airS[1], 0.7071);
+            airOutHP.setHighPass(sr, (double) airS[1], 0.7071);
+            airLP.setLowPass(sr, std::min(12000.0, 0.4 * sr), 0.7071);
+            airShelf.setHighShelf(sr, (double) airS[1] * 0.8, (double) airS[0] * 8.0);   // up to +8 dB
+        }
+        prevEqOn = eqOn;
+        prevAirOn = airOn;
 
         const float minCoef = 1.f - std::exp(-1.f / (0.0015f * (float) sr));
         const float coef = retMs <= 0.01f ? minCoef
                          : juce::jmax(minCoef, 1.f - std::exp(-1.f / (retMs * 0.001f * (float) sr)));
         const float releaseCoef = 1.f - std::exp(-1.f / (0.02f * (float) sr));
-        const float lpA = 1.f - std::exp(-juce::MathConstants<float>::twoPi * 900.f / (float) sr);
+        const float lpA  = 1.f - std::exp(-juce::MathConstants<float>::twoPi * 900.f / (float) sr);
+        const float detA = 1.f - std::exp(-juce::MathConstants<float>::twoPi * 80.f / (float) sr);
+        const float fadeCoef = 1.f - std::exp(-1.f / (0.005f * (float) sr));
+        const float atkCoef = 1.f - std::exp(-1.f / (0.001f * (float) sr));
+        const float relCoef = 1.f - std::exp(-1.f / (0.04f * (float) sr));
 
         const float drive = 1.f + grit * 6.f;
         const float invDrive = 1.f / std::sqrt(drive);
@@ -190,44 +271,7 @@ public:
         const float combNorm = 1.f / (1.f + fb * 0.6f);
         const float outGain = juce::Decibels::decibelsToGain(outDb);
 
-        // ---- extra modules ----
-        const bool eqOn   = *apvts.getRawParameterValue("eq_on") > 0.5f;
-        const bool airOn  = *apvts.getRawParameterValue("air_on") > 0.5f;
-        const float airAmt  = *apvts.getRawParameterValue("air_amount");
-        const float airFreq = *apvts.getRawParameterValue("air_freq");
-        const float lowCut  = *apvts.getRawParameterValue("eq_lowcut");
-        const float gLow    = *apvts.getRawParameterValue("eq_low");
-        const float gLoMid  = *apvts.getRawParameterValue("eq_lomid");
-        const float gHiMid  = *apvts.getRawParameterValue("eq_himid");
-        const float gHigh   = *apvts.getRawParameterValue("eq_high");
-        const bool eqUseHP = lowCut > 20.5f;
-        if (eqOn && !prevEqOn)
-            for (Biquad* b : { &eqHP, &eqLow, &eqLoMid, &eqHiMid, &eqHigh }) b->reset();
-        if (airOn && !prevAirOn)
-        {
-            for (Biquad* b : { &airHP, &airOutHP, &airShelf }) b->reset();
-            airEnv[0] = airEnv[1] = 0.f;
-        }
-        if (eqOn || eqFade > 0.0005f)
-        {
-            eqHP.setHighPass(sr, (double) lowCut, 0.7071);
-            eqLow.setLowShelf(sr, 120.0, (double) gLow);
-            eqLoMid.setPeak(sr, 350.0, 0.9, (double) gLoMid);
-            eqHiMid.setPeak(sr, 3500.0, 0.9, (double) gHiMid);
-            eqHigh.setHighShelf(sr, 8000.0, (double) gHigh);
-        }
-        if (airOn || airFade > 0.0005f)
-        {
-            airHP.setHighPass(sr, (double) airFreq, 0.7071);
-            airOutHP.setHighPass(sr, (double) airFreq, 0.7071);
-            airShelf.setHighShelf(sr, (double) airFreq * 0.8, (double) airAmt * 6.0);
-        }
-        prevEqOn = eqOn;
-        prevAirOn = airOn;
-        const float envCoef = 1.f - std::exp(-1.f / (0.004f * (float) sr));
-        const float fadeCoef = 1.f - std::exp(-1.f / (0.005f * (float) sr));
-
-        float pk = 0.f;
+        float pk = 0.f, airAcc = 0.f;
 
         for (int i = 0; i < n; ++i)
         {
@@ -239,7 +283,8 @@ public:
                 mono += in;
             }
             mono /= (float) nCh;
-            det[(size_t) (wp & kMask)] = mono;
+            detLP += detA * (mono - detLP);                  // 80 Hz high-pass for the pitch detector
+            det[(size_t) (wp & kMask)] = mono - detLP;
             lpState += lpA * (mono - lpState);
             lp[(size_t) (wp & kMask)] = lpState;
 
@@ -250,21 +295,31 @@ public:
 
             generateGrains(nCh);
 
-            eqFade  += fadeCoef * ((eqOn  ? 1.f : 0.f) - eqFade);
-            airFade += fadeCoef * ((airOn ? 1.f : 0.f) - airFade);
-
             combT += 0.002f * ((float) (sr / (double) outFreq) - combT);
             combT = juce::jlimit(8.f, (float) (kBuf - 4), combT);
+
+            eqFade   += fadeCoef * ((eqOn   ? 1.f : 0.f) - eqFade);
+            airFade  += fadeCoef * ((airOn  ? 1.f : 0.f) - airFade);
+            tuneFade += fadeCoef * ((tuneOn ? 1.f : 0.f) - tuneFade);
+            const float mixEff = mix * tuneFade;
+
+            // exact overlap-add normalisation: constant level whatever the shift
+            const size_t wi = (size_t) (wp & kMask);
+            const float norm = 1.f / juce::jmax(wsum[wi], 0.2f);
+            wsum[wi] = 0.f;
 
             for (int c = 0; c < nCh; ++c)
             {
                 float* io = buf.getWritePointer(c);
 
-                float wet = outB[(size_t) c][(size_t) (wp & kMask)];
-                outB[(size_t) c][(size_t) (wp & kMask)] = 0.f;
+                float wet = outB[(size_t) c][wi] * norm;
+                outB[(size_t) c][wi] = 0.f;
 
-                const float yc = wet + fb * readAt(comb[(size_t) c], (double) wp - (double) combT);
-                comb[(size_t) c][(size_t) (wp & kMask)] = yc;
+                // robot comb with a damped feedback path (cleaner, less harsh ringing)
+                const float fbRead = readAt(comb[(size_t) c], (double) wp - (double) combT);
+                combLP[c] += 0.55f * (fbRead - combLP[c]);
+                const float yc = wet + fb * combLP[c];
+                comb[(size_t) c][wi] = yc;
                 wet = yc * combNorm;
 
                 if (grit > 0.001f)
@@ -274,8 +329,9 @@ public:
                 }
 
                 const float dry = dl[(size_t) c][(size_t) ((wp - delay0) & kMask)];
-                float out = dry * (1.f - mix) + wet * mix;
+                float out = dry * (1.f - mixEff) + wet * mixEff;
 
+                // ---- EQUALIZER ----
                 if (eqFade > 0.0005f)
                 {
                     float y = out;
@@ -284,19 +340,29 @@ public:
                     y = eqLoMid.process(c, y);
                     y = eqHiMid.process(c, y);
                     y = eqHigh.process(c, y);
+                    if (eqUseLP) y = eqLP.process(c, y);
                     out += eqFade * (y - out);
                 }
+
+                // ---- FRESH AIR: dynamic lift + harmonic exciter, tamed on sibilance ----
                 if (airFade > 0.0005f)
                 {
-                    // Fresh Air: high shelf + level-following harmonic exciter on the top band
                     const float band = airHP.process(c, out);
                     const float a = std::abs(band);
-                    airEnv[c] += envCoef * (a - airEnv[c]);
+                    airEnv[c] += (a > airEnv[c] ? atkCoef : relCoef) * (a - airEnv[c]);
                     const float e = airEnv[c] + 1e-7f;
-                    const float sat = e * std::tanh(1.2f * band / e);
-                    const float exc = airOutHP.process(c, 0.5f * sat + (a - e));
-                    const float y = airShelf.process(c, out) + exc * airAmt * 0.8f;
-                    out += airFade * (y - out);
+                    const float dyn = 1.f / (1.f + smoothAmt * 30.f * airEnv[c]);
+
+                    // smooth shelf lift (no phase dip below the corner), reduced when the highs are loud
+                    const float lift = (airShelf.process(c, out) - out) * dyn;
+
+                    const float bl = airLP.process(c, band);
+                    const float sat = e * std::tanh(1.2f * bl / e);
+                    const float exc = airOutHP.process(c, 0.5f * sat + (std::abs(bl) - e));
+
+                    const float add = (lift + exc * sparkle * 0.6f * dyn) * airFade;
+                    out += add;
+                    airAcc += std::abs(add);
                 }
 
                 out = softClip(out * outGain);
@@ -306,6 +372,11 @@ public:
             ++wp;
         }
         outLevel.store(juce::jmax(pk, outLevel.load() * 0.9f));
+        {
+            const float lvl = airAcc / (float) (juce::jmax(1, n) * juce::jmax(1, nCh));
+            const float db = 20.f * std::log10(lvl + 1e-5f);
+            airActivity.store(juce::jmax(juce::jlimit(0.f, 1.f, (db + 70.f) / 45.f), airActivity.load() * 0.85f));
+        }
     }
 
     // shared with the editor
@@ -314,6 +385,7 @@ public:
     std::atomic<float> meterTarget { 0.f };
     std::atomic<bool> meterVoiced { false };
     std::atomic<float> outLevel { 0.f };
+    std::atomic<float> airActivity { 0.f };
 
 private:
     static constexpr int kBuf = 1 << 15;
@@ -324,20 +396,21 @@ private:
     long long wp = 0;
     double nextTs = 0.0, anaMark = 0.0;
     float T0cur = 220.f, curMidiOut = 55.f, targetMidiOut = 55.f, outFreq = 200.f, combT = 200.f;
-    float lpState = 0.f;
+    float lpState = 0.f, detLP = 0.f;
+    float combLP[2] = { 0.f, 0.f };
     bool snapOn = false;
     int keyIdx = 0, scaleIdx = 0;
     float amountP = 1.f;
     float hist[5] = { 0, 0, 0, 0, 0 };
     int histN = 0, histIdx = 0, unvoicedHops = 0, curNote = -1;
     std::array<std::vector<float>, 2> dl, outB, comb;
-    std::vector<float> det, lp, scratch, yin;
+    std::vector<float> wsum, det, lp, scratch, yin;
 
-    // extra modules: 4-band EQ (+ low cut) and Fresh Air
-    Biquad eqHP, eqLow, eqLoMid, eqHiMid, eqHigh, airHP, airOutHP, airShelf;
+    Biquad eqHP, eqLow, eqLoMid, eqHiMid, eqHigh, eqLP, airHP, airLP, airOutHP, airShelf;
     float airEnv[2] = { 0.f, 0.f };
-    bool prevEqOn = false, prevAirOn = false;
-    float eqFade = 0.f, airFade = 0.f;   // smooth on/off so toggling never clicks
+    bool prevEqOn = false, prevAirOn = false, fxInit = false;
+    float eqFade = 0.f, airFade = 0.f, tuneFade = 1.f;   // smooth on/off so toggling never clicks
+    float eqS[10] = { 0 }, airS[4] = { 0 };
 
     float readAt(const std::vector<float>& b, double pos) const
     {
@@ -387,16 +460,17 @@ private:
             const double curFreq = 440.0 * std::pow(2.0, ((double) curMidiOut - 69.0) / 12.0);
             const double Ts = juce::jlimit(sr / 2000.0, sr / 40.0, sr / curFreq);
             outFreq = (float) curFreq;
-            const float scale = (float) (Ts / T);
 
             const long long tsInt = (long long) std::floor(nextTs + 0.5);
             const double frac = nextTs - (double) tsInt;
 
             for (int k = -Ti; k <= Ti; ++k)
             {
-                const float w = (0.5f + 0.5f * std::cos(juce::MathConstants<float>::pi * (float) k / (float) Ti)) * scale;
+                const float w = 0.5f + 0.5f * std::cos(juce::MathConstants<float>::pi * (float) k / (float) Ti);
+                const size_t idx = (size_t) ((tsInt + k) & kMask);
+                wsum[idx] += w;
                 for (int c = 0; c < nCh; ++c)
-                    outB[(size_t) c][(size_t) ((tsInt + k) & kMask)] += w * readAt(dl[(size_t) c], anaMark + (double) k - frac);
+                    outB[(size_t) c][idx] += w * readAt(dl[(size_t) c], anaMark + (double) k - frac);
             }
             nextTs += Ts;
         }
@@ -406,38 +480,42 @@ private:
     {
         using namespace juce;
         AudioProcessorValueTreeState::ParameterLayout l;
+        auto F = [&l](const char* id, const char* name, float lo, float hi, float step, float skew, float def)
+        {
+            l.add(std::make_unique<AudioParameterFloat>(ParameterID{id, 1}, name,
+                  NormalisableRange<float>(lo, hi, step, skew), def));
+        };
+
+        // auto tune
+        l.add(std::make_unique<AudioParameterBool>(ParameterID{"tune_on", 1}, "Auto Tune On", true));
         l.add(std::make_unique<AudioParameterChoice>(ParameterID{"key", 1}, "Key", keyNames(), 0));
         l.add(std::make_unique<AudioParameterChoice>(ParameterID{"scale", 1}, "Scale", scaleNames(), 2));
-        l.add(std::make_unique<AudioParameterFloat>(ParameterID{"retune", 1}, "Retune Speed",
-              NormalisableRange<float>(0.f, 200.f, 0.1f, 0.5f), 0.f));
-        l.add(std::make_unique<AudioParameterFloat>(ParameterID{"amount", 1}, "Amount",
-              NormalisableRange<float>(0.f, 1.f, 0.001f), 1.f));
-        l.add(std::make_unique<AudioParameterFloat>(ParameterID{"robot", 1}, "Robot",
-              NormalisableRange<float>(0.f, 1.f, 0.001f), 0.3f));
-        l.add(std::make_unique<AudioParameterFloat>(ParameterID{"grit", 1}, "Grit",
-              NormalisableRange<float>(0.f, 1.f, 0.001f), 0.f));
-        l.add(std::make_unique<AudioParameterFloat>(ParameterID{"mix", 1}, "Mix",
-              NormalisableRange<float>(0.f, 1.f, 0.001f), 1.f));
-        l.add(std::make_unique<AudioParameterFloat>(ParameterID{"output", 1}, "Output",
-              NormalisableRange<float>(-12.f, 12.f, 0.1f), 0.f));
+        F("retune", "Retune Speed", 0.f, 200.f, 0.1f, 0.5f, 0.f);
+        F("amount", "Amount", 0.f, 1.f, 0.001f, 1.f, 1.f);
+        F("robot",  "Robot",  0.f, 1.f, 0.001f, 1.f, 0.3f);
+        F("grit",   "Grit",   0.f, 1.f, 0.001f, 1.f, 0.f);
+        F("mix",    "Mix",    0.f, 1.f, 0.001f, 1.f, 1.f);
+        F("output", "Output", -12.f, 12.f, 0.1f, 1.f, 0.f);
 
+        // fresh air
         l.add(std::make_unique<AudioParameterBool>(ParameterID{"air_on", 1}, "Fresh Air On", false));
-        l.add(std::make_unique<AudioParameterFloat>(ParameterID{"air_amount", 1}, "Air Amount",
-              NormalisableRange<float>(0.f, 1.f, 0.001f), 0.4f));
-        l.add(std::make_unique<AudioParameterFloat>(ParameterID{"air_freq", 1}, "Air Shine Frequency",
-              NormalisableRange<float>(3000.f, 12000.f, 1.f, 0.6f), 8000.f));
+        F("air_amount",  "Air Amount",          0.f, 1.f, 0.001f, 1.f, 0.4f);
+        F("air_freq",    "Air Shine Frequency", 3000.f, 12000.f, 1.f, 0.6f, 8000.f);
+        F("air_sparkle", "Air Sparkle",         0.f, 1.f, 0.001f, 1.f, 0.3f);
+        F("air_smooth",  "Air Smooth",          0.f, 1.f, 0.001f, 1.f, 0.5f);
 
+        // equalizer
         l.add(std::make_unique<AudioParameterBool>(ParameterID{"eq_on", 1}, "EQ On", false));
-        l.add(std::make_unique<AudioParameterFloat>(ParameterID{"eq_lowcut", 1}, "EQ Low Cut",
-              NormalisableRange<float>(20.f, 400.f, 1.f, 0.4f), 20.f));
-        l.add(std::make_unique<AudioParameterFloat>(ParameterID{"eq_low", 1}, "EQ Low",
-              NormalisableRange<float>(-12.f, 12.f, 0.1f), 0.f));
-        l.add(std::make_unique<AudioParameterFloat>(ParameterID{"eq_lomid", 1}, "EQ Low Mid",
-              NormalisableRange<float>(-12.f, 12.f, 0.1f), 0.f));
-        l.add(std::make_unique<AudioParameterFloat>(ParameterID{"eq_himid", 1}, "EQ High Mid",
-              NormalisableRange<float>(-12.f, 12.f, 0.1f), 0.f));
-        l.add(std::make_unique<AudioParameterFloat>(ParameterID{"eq_high", 1}, "EQ High",
-              NormalisableRange<float>(-12.f, 12.f, 0.1f), 0.f));
+        F("eq_lowcut",  "EQ Low Cut",       20.f, 400.f, 1.f, 0.4f, 20.f);
+        F("eq_low",     "EQ Low Gain",      -12.f, 12.f, 0.1f, 1.f, 0.f);
+        F("eq_low_f",   "EQ Low Freq",      40.f, 400.f, 1.f, 0.5f, 120.f);
+        F("eq_lomid",   "EQ Low Mid Gain",  -12.f, 12.f, 0.1f, 1.f, 0.f);
+        F("eq_lomid_f", "EQ Low Mid Freq",  150.f, 1500.f, 1.f, 0.5f, 350.f);
+        F("eq_himid",   "EQ High Mid Gain", -12.f, 12.f, 0.1f, 1.f, 0.f);
+        F("eq_himid_f", "EQ High Mid Freq", 1000.f, 8000.f, 1.f, 0.5f, 3500.f);
+        F("eq_high",    "EQ High Gain",     -12.f, 12.f, 0.1f, 1.f, 0.f);
+        F("eq_high_f",  "EQ High Freq",     3000.f, 16000.f, 1.f, 0.5f, 8000.f);
+        F("eq_highcut", "EQ High Cut",      2000.f, 20000.f, 1.f, 0.4f, 20000.f);
         return l;
     }
 
@@ -557,6 +635,9 @@ private:
 //==============================================================================
 static const juce::Colour kGold(0xfff5c542);
 static const juce::Colour kRed(0xffe02020);
+static const juce::Colour kGreen(0xff39d353);
+static const juce::Colour kBand[4] = { juce::Colour(0xffff6b5a), juce::Colour(0xffffb347),
+                                       juce::Colour(0xff6fd3a8), juce::Colour(0xff6fb7ff) };
 
 class BTLookAndFeel : public juce::LookAndFeel_V4
 {
@@ -572,7 +653,7 @@ public:
     void drawRotarySlider(juce::Graphics& g, int x, int y, int width, int height,
                           float sliderPos, float startAngle, float endAngle, juce::Slider&) override
     {
-        auto bounds = juce::Rectangle<float>((float) x, (float) y, (float) width, (float) height).reduced(12.f);
+        auto bounds = juce::Rectangle<float>((float) x, (float) y, (float) width, (float) height).reduced(10.f);
         const float r = juce::jmin(bounds.getWidth(), bounds.getHeight()) / 2.f;
         const auto c = bounds.getCentre();
         const float ang = startAngle + sliderPos * (endAngle - startAngle);
@@ -638,6 +719,25 @@ public:
                               bool highlighted, bool down) override
     {
         auto r = b.getLocalBounds().toFloat().reduced(0.5f);
+
+        if (b.getProperties().contains("tab"))
+        {
+            const bool sel = b.getToggleState();
+            juce::Colour top = sel ? juce::Colour(0xff303030) : juce::Colour(0xff1a1a1a);
+            const juce::Colour bot = sel ? juce::Colour(0xff121212) : juce::Colour(0xff0a0a0a);
+            if (highlighted && !sel) top = top.brighter(0.2f);
+            g.setGradientFill(juce::ColourGradient(top, 0.f, r.getY(), bot, 0.f, r.getBottom(), false));
+            g.fillRoundedRectangle(r, 8.f);
+            g.setColour(kGold.withAlpha(sel ? 0.8f : 0.25f));
+            g.drawRoundedRectangle(r, 8.f, 1.f);
+            if (sel)
+            {
+                g.setColour(kGold);
+                g.fillRoundedRectangle(r.getX() + 14.f, r.getBottom() - 4.f, r.getWidth() - 28.f, 3.f, 1.5f);
+            }
+            return;
+        }
+
         juce::Colour top(0xff2d2d2d), bot(0xff0d0d0d);
         if (highlighted) top = top.brighter(0.25f);
         if (down) std::swap(top, bot);
@@ -647,9 +747,9 @@ public:
         g.drawRoundedRectangle(r, 5.f, 1.f);
     }
 
-    juce::Font getTextButtonFont(juce::TextButton&, int) override
+    juce::Font getTextButtonFont(juce::TextButton& b, int) override
     {
-        return juce::Font(juce::FontOptions(11.f, juce::Font::bold));
+        return juce::Font(juce::FontOptions(b.getProperties().contains("tab") ? 14.f : 11.f, juce::Font::bold));
     }
 
     void drawToggleButton(juce::Graphics& g, juce::ToggleButton& b, bool highlighted, bool) override
@@ -657,20 +757,20 @@ public:
         auto r = b.getLocalBounds().toFloat().reduced(0.5f);
         const bool on = b.getToggleState();
         juce::Colour top = on ? juce::Colour(0xff2a3a2a) : juce::Colour(0xff2d2d2d);
-        juce::Colour bot(0xff0d0d0d);
+        const juce::Colour bot(0xff0d0d0d);
         if (highlighted) top = top.brighter(0.2f);
         g.setGradientFill(juce::ColourGradient(top, 0.f, r.getY(), bot, 0.f, r.getBottom(), false));
         g.fillRoundedRectangle(r, 5.f);
-        g.setColour((on ? juce::Colour(0xff39d353) : kGold).withAlpha(highlighted ? 0.95f : 0.55f));
+        g.setColour((on ? kGreen : kGold).withAlpha(highlighted ? 0.95f : 0.55f));
         g.drawRoundedRectangle(r, 5.f, 1.f);
 
         auto led = juce::Rectangle<float>(r.getX() + 9.f, r.getCentreY() - 5.f, 10.f, 10.f);
         if (on)
         {
-            g.setColour(juce::Colour(0xff39d353).withAlpha(0.3f));
+            g.setColour(kGreen.withAlpha(0.3f));
             g.fillEllipse(led.expanded(4.f));
         }
-        g.setColour(on ? juce::Colour(0xff39d353) : juce::Colour(0xff3a3a3a));
+        g.setColour(on ? kGreen : juce::Colour(0xff3a3a3a));
         g.fillEllipse(led);
         g.setColour(juce::Colours::black.withAlpha(0.7f));
         g.drawEllipse(led, 1.f);
@@ -702,74 +802,74 @@ class BlackTuneEditor : public juce::AudioProcessorEditor, private juce::Timer
 public:
     explicit BlackTuneEditor(BlackTune& p) : AudioProcessorEditor(&p), proc(p)
     {
-        setSize(800, 700);
+        setSize(800, 576);
         setLookAndFeel(&laf);
 
-        const char* ids[6]   = { "retune", "amount", "robot", "grit", "mix", "output" };
-        const char* names[6] = { "RETUNE SPEED", "AMOUNT", "ROBOT", "GRIT", "MIX", "OUTPUT" };
-        for (int i = 0; i < 6; ++i)
+        // ---- tabs ----
+        const char* tn[3] = { "AUTO TUNE", "FRESH AIR", "EQUALIZER" };
+        for (int i = 0; i < 3; ++i)
         {
-            auto& k = knobs[(size_t) i];
-            k.s.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
-            k.s.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 90, 18);
-            k.s.setRotaryParameters(juce::MathConstants<float>::pi * 1.2f,
-                                    juce::MathConstants<float>::pi * 2.8f, true);
-            k.s.setColour(juce::Slider::textBoxTextColourId, juce::Colour(0xffe8e8e8));
-            k.s.setColour(juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
-            addAndMakeVisible(k.s);
-
-            k.l.setText(names[i], juce::dontSendNotification);
-            k.l.setJustificationType(juce::Justification::centred);
-            k.l.setColour(juce::Label::textColourId, i == 0 ? kGold : juce::Colour(0xffbdbdbd));
-            k.l.setFont(juce::Font(juce::FontOptions(13.f, juce::Font::bold)));
-            addAndMakeVisible(k.l);
-
-            k.a = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(proc.apvts, ids[i], k.s);
-
-            if (i == 0)
-            {
-                k.s.textFromValueFunction = [](double v) { return juce::String(v, 1) + " ms"; };
-                k.s.valueFromTextFunction = [](const juce::String& t) { return t.getDoubleValue(); };
-            }
-            else if (i == 5)
-            {
-                k.s.textFromValueFunction = [](double v) { return juce::String(v, 1) + " dB"; };
-                k.s.valueFromTextFunction = [](const juce::String& t) { return t.getDoubleValue(); };
-            }
-            else
-            {
-                k.s.textFromValueFunction = [](double v) { return juce::String((int) std::round(v * 100.0)) + " %"; };
-                k.s.valueFromTextFunction = [](const juce::String& t) { return t.getDoubleValue() / 100.0; };
-            }
-            k.s.updateText();
+            auto& t = tabs[(size_t) i];
+            t.setButtonText(tn[i]);
+            t.getProperties().set("tab", true);
+            t.setClickingTogglesState(true);
+            t.setRadioGroupId(101);
+            t.setColour(juce::TextButton::textColourOffId, juce::Colour(0xff9a9a9a));
+            t.setColour(juce::TextButton::textColourOnId, juce::Colours::white);
+            t.onClick = [this, i] { setPage(i); };
+            addAndMakeVisible(t);
         }
+        tabs[0].setToggleState(true, juce::dontSendNotification);
+
+        // ---- auto tune page ----
+        const char* tIds[6]   = { "retune", "amount", "robot", "grit", "mix", "output" };
+        const char* tNames[6] = { "RETUNE SPEED", "AMOUNT", "ROBOT", "GRIT", "MIX", "OUTPUT" };
+        const int tKinds[6]   = { 1, 0, 0, 0, 0, 2 };
+        for (int i = 0; i < 6; ++i) setupKnob(knobs[(size_t) i], tIds[i], tNames[i], tKinds[i], i == 0);
 
         setupCombo(keyBox, keyNames());
         setupCombo(scaleBox, scaleNames());
         keyA = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(proc.apvts, "key", keyBox);
         scaleA = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(proc.apvts, "scale", scaleBox);
 
-        const char* fxIds[7]   = { "air_amount", "air_freq", "eq_lowcut", "eq_low", "eq_lomid", "eq_himid", "eq_high" };
-        const char* fxNames[7] = { "AIR", "SHINE", "LOW CUT", "LOW", "LOW MID", "HIGH MID", "HIGH" };
-        const int fxKinds[7]   = { 0, 1, 2, 3, 3, 3, 3 };
-        for (int i = 0; i < 7; ++i)
-            setupFxKnob(fx[(size_t) i], fxIds[i], fxNames[i], fxKinds[i]);
+        const char* pn[5] = { "HARD TUNE", "ROBOT", "CLEAN", "NATURAL", "DESTROY" };
+        for (int i = 0; i < 5; ++i) setupPreset(presets[(size_t) i], pn[i], [this, i] { applyTunePreset(i); });
 
+        // ---- fresh air page ----
+        const char* aNames[4] = { "AIR", "SHINE", "SPARKLE", "SMOOTH" };
+        const int aKinds[4]   = { 0, 3, 0, 0 };
+        for (int i = 0; i < 4; ++i) setupKnob(airK[(size_t) i], kAirIds[i], aNames[i], aKinds[i], false);
+        const char* apn[3] = { "NATURAL", "BRIGHT", "SILKY" };
+        for (int i = 0; i < 3; ++i) setupPreset(airPresets[(size_t) i], apn[i], [this, i] { applyAirPreset(i); });
+
+        // ---- equalizer page ----
+        const char* eNames[10] = { "LOW CUT", "GAIN", "FREQ", "GAIN", "FREQ", "GAIN", "FREQ", "GAIN", "FREQ", "HIGH CUT" };
+        const int eKinds[10]   = { 5, 2, 4, 2, 4, 2, 4, 2, 4, 6 };
+        for (int i = 0; i < 10; ++i) setupKnob(eqK[(size_t) i], kEqIds[i], eNames[i], eKinds[i], false);
+        const char* epn[4] = { "FLAT", "VOCAL", "WARM", "RADIO" };
+        for (int i = 0; i < 4; ++i) setupPreset(eqPresets[(size_t) i], epn[i], [this, i] { applyEqPreset(i); });
+
+        // ---- power buttons ----
+        addAndMakeVisible(tuneBtn);
         addAndMakeVisible(airBtn);
         addAndMakeVisible(eqBtn);
-        airA = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(proc.apvts, "air_on", airBtn);
-        eqA  = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(proc.apvts, "eq_on", eqBtn);
+        tuneA = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(proc.apvts, "tune_on", tuneBtn);
+        airA  = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(proc.apvts, "air_on", airBtn);
+        eqA   = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(proc.apvts, "eq_on", eqBtn);
 
-        const char* pn[5] = { "HARD TUNE", "ROBOT", "CLEAN", "NATURAL", "DESTROY" };
-        for (int i = 0; i < 5; ++i)
-        {
-            presets[(size_t) i].setButtonText(pn[i]);
-            presets[(size_t) i].setColour(juce::TextButton::textColourOffId, kGold);
-            presets[(size_t) i].setColour(juce::TextButton::textColourOnId, kGold);
-            presets[(size_t) i].onClick = [this, i] { applyPreset(i); };
-            addAndMakeVisible(presets[(size_t) i]);
-        }
+        // ---- which components belong to which page ----
+        auto reg = [this](int pg, juce::Component& c) { pageComps[pg].push_back(&c); };
+        for (auto& k : knobs) { reg(0, k.s); reg(0, k.l); }
+        reg(0, keyBox); reg(0, scaleBox); reg(0, tuneBtn);
+        for (auto& b : presets) reg(0, b);
+        for (auto& k : airK) { reg(1, k.s); reg(1, k.l); }
+        reg(1, airBtn);
+        for (auto& b : airPresets) reg(1, b);
+        for (auto& k : eqK) { reg(2, k.s); reg(2, k.l); }
+        reg(2, eqBtn);
+        for (auto& b : eqPresets) reg(2, b);
 
+        setPage(0);
         startTimerHz(30);
     }
 
@@ -777,38 +877,45 @@ public:
 
     void resized() override
     {
+        for (int i = 0; i < 3; ++i) tabs[(size_t) i].setBounds(20 + i * 254, 80, 252, 34);
+
+        // auto tune page
         for (int i = 0; i < 6; ++i)
         {
-            juce::Rectangle<int> col(20 + i * 127, 378, 127, 130);
+            juce::Rectangle<int> col(20 + i * 127, 416, 127, 138);
             knobs[(size_t) i].l.setBounds(col.removeFromTop(20));
             knobs[(size_t) i].s.setBounds(col);
         }
-        keyBox.setBounds(64, 332, 88, 28);
-        scaleBox.setBounds(236, 332, 176, 28);
+        keyBox.setBounds(58, 370, 78, 28);
+        scaleBox.setBounds(198, 370, 150, 28);
+        for (int i = 0; i < 5; ++i) presets[(size_t) i].setBounds(362 + i * 66, 370, 62, 28);
+        tuneBtn.setBounds(700, 370, 70, 28);
 
-        for (int i = 0; i < 2; ++i)
+        // fresh air page
+        airBtn.setBounds(700, 134, 70, 26);
+        for (int i = 0; i < 3; ++i) airPresets[(size_t) i].setBounds(412 + i * 84, 134, 80, 26);
+        for (int i = 0; i < 4; ++i)
         {
-            juce::Rectangle<int> col(30 + i * 115, 556, 115, 126);
-            fx[(size_t) i].l.setBounds(col.removeFromTop(20));
-            fx[(size_t) i].s.setBounds(col);
+            juce::Rectangle<int> col(36 + i * 182, 376, 182, 184);
+            airK[(size_t) i].l.setBounds(col.removeFromTop(20));
+            airK[(size_t) i].s.setBounds(col);
         }
-        for (int i = 0; i < 5; ++i)
+
+        // equalizer page
+        eqBtn.setBounds(700, 134, 70, 26);
+        for (int i = 0; i < 4; ++i) eqPresets[(size_t) i].setBounds(412 + i * 66, 134, 62, 26);
+        for (int i = 0; i < 10; ++i)
         {
-            juce::Rectangle<int> col(292 + i * 97, 556, 97, 126);
-            fx[(size_t) (2 + i)].l.setBounds(col.removeFromTop(20));
-            fx[(size_t) (2 + i)].s.setBounds(col);
+            juce::Rectangle<int> col(36 + i * 73, 358, 73, 202);
+            eqK[(size_t) i].l.setBounds(col.removeFromTop(20));
+            eqK[(size_t) i].s.setBounds(col);
         }
-        airBtn.setBounds(196, 526, 68, 24);
-        eqBtn.setBounds(700, 526, 68, 24);
-        for (int i = 0; i < 5; ++i)
-            presets[(size_t) i].setBounds(434 + i * 68, 332, 64, 28);
     }
 
     void paint(juce::Graphics& g) override
     {
         const int W = getWidth(), H = getHeight();
 
-        // background: carbon gradient, brushed lines, vignette
         g.setGradientFill(juce::ColourGradient(juce::Colour(0xff202020), 0.f, 0.f,
                                                juce::Colour(0xff060606), 0.f, (float) H, false));
         g.fillAll();
@@ -820,29 +927,30 @@ public:
 
         drawHeader(g, W);
 
-        drawPanel(g, meterPanel);
-        drawPanel(g, kbPanel);
-        drawPanel(g, stripPanel);
-        drawPanel(g, knobPanel);
-        drawPanel(g, fxPanel);
+        if (page == 0)      drawTunePage(g);
+        else if (page == 1) drawAirPage(g);
+        else                drawEqPage(g);
+    }
 
-        drawMeter(g);
-        drawKeyboard(g);
-
-        const bool airOnNow = *proc.apvts.getRawParameterValue("air_on") > 0.5f;
-        const bool eqOnNow  = *proc.apvts.getRawParameterValue("eq_on") > 0.5f;
-        g.setFont(juce::Font(juce::FontOptions(14.f, juce::Font::bold)));
-        g.setColour(airOnNow ? kGold : juce::Colour(0xff8a8a8a));
-        g.drawText("FRESH AIR", 34, 526, 150, 24, juce::Justification::centredLeft);
-        g.setColour(eqOnNow ? kGold : juce::Colour(0xff8a8a8a));
-        g.drawText("EQUALIZER", 300, 526, 200, 24, juce::Justification::centredLeft);
-        g.setColour(kGold.withAlpha(0.2f));
-        g.drawLine(281.f, 530.f, 281.f, 684.f, 1.f);
-
-        g.setColour(juce::Colour(0xffbdbdbd));
-        g.setFont(juce::Font(juce::FontOptions(13.f, juce::Font::bold)));
-        g.drawText("KEY", 32, 332, 32, 28, juce::Justification::centredLeft);
-        g.drawText("SCALE", 172, 332, 62, 28, juce::Justification::centredLeft);
+    // power LEDs on the tabs are drawn above the tab buttons
+    void paintOverChildren(juce::Graphics& g) override
+    {
+        const char* ids[3] = { "tune_on", "air_on", "eq_on" };
+        for (int i = 0; i < 3; ++i)
+        {
+            const bool on = proc.apvts.getRawParameterValue(ids[i])->load() > 0.5f;
+            const auto b = tabs[(size_t) i].getBounds().toFloat();
+            const auto led = juce::Rectangle<float>(b.getX() + 18.f, b.getCentreY() - 5.f, 10.f, 10.f);
+            if (on)
+            {
+                g.setColour(kGreen.withAlpha(0.3f));
+                g.fillEllipse(led.expanded(4.f));
+            }
+            g.setColour(on ? kGreen : juce::Colour(0xff3a3a3a));
+            g.fillEllipse(led);
+            g.setColour(juce::Colours::black.withAlpha(0.7f));
+            g.drawEllipse(led, 1.f);
+        }
     }
 
 private:
@@ -856,87 +964,60 @@ private:
         std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> a;
     };
     std::array<Knob, 6> knobs;
-    std::array<Knob, 7> fx;   // 0-1 Fresh Air, 2-6 EQ
-    juce::ToggleButton airBtn, eqBtn;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> airA, eqA;
-    int lastAir = -1, lastEq = -1;
+    std::array<Knob, 4> airK;
+    std::array<Knob, 10> eqK;
     juce::ComboBox keyBox, scaleBox;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> keyA, scaleA;
     std::array<juce::TextButton, 5> presets;
+    std::array<juce::TextButton, 3> airPresets;
+    std::array<juce::TextButton, 4> eqPresets;
+    std::array<juce::TextButton, 3> tabs;
+    juce::ToggleButton tuneBtn, airBtn, eqBtn;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> tuneA, airA, eqA;
+    std::vector<juce::Component*> pageComps[3];
+    int page = 0;
+    int lastOn[3] = { -1, -1, -1 };
 
-    const juce::Rectangle<int> meterPanel { 20, 84, 760, 130 };
-    const juce::Rectangle<int> kbPanel { 20, 224, 760, 94 };
-    const juce::Rectangle<int> stripPanel { 20, 326, 760, 40 };
-    const juce::Rectangle<int> knobPanel { 20, 374, 760, 136 };
-    const juce::Rectangle<int> fxPanel { 20, 518, 760, 172 };
+    // tune page
+    const juce::Rectangle<int> meterPanel { 20, 124, 760, 130 };
+    const juce::Rectangle<int> kbPanel { 20, 262, 760, 94 };
+    const juce::Rectangle<int> stripPanel { 20, 364, 760, 40 };
+    const juce::Rectangle<int> knobPanel { 20, 412, 760, 146 };
+    // air + eq pages
+    const juce::Rectangle<int> fxPanel { 20, 124, 760, 444 };
+    const juce::Rectangle<int> airCurve { 36, 172, 728, 170 };
+    const juce::Rectangle<int> airBar { 36, 350, 728, 18 };
+    const juce::Rectangle<int> eqCurve { 36, 172, 728, 160 };
+
+    //==========================================================================
+    void setPage(int idx)
+    {
+        page = idx;
+        for (int p = 0; p < 3; ++p)
+            for (auto* c : pageComps[p]) c->setVisible(p == idx);
+        repaint();
+    }
 
     void timerCallback() override
     {
-        repaint(meterPanel.getUnion(kbPanel));
+        if (page == 0)      repaint(meterPanel.getUnion(kbPanel));
+        else if (page == 1) repaint(airCurve.getUnion(airBar));
+        else                repaint(eqCurve);
 
-        const int airOn = *proc.apvts.getRawParameterValue("air_on") > 0.5f ? 1 : 0;
-        const int eqOn  = *proc.apvts.getRawParameterValue("eq_on") > 0.5f ? 1 : 0;
-        if (airOn != lastAir)
+        const char* ids[3] = { "tune_on", "air_on", "eq_on" };
+        for (int i = 0; i < 3; ++i)
         {
-            lastAir = airOn;
-            for (size_t i = 0; i < 2; ++i) setFxDim(fx[i], airOn == 1);
-            repaint(fxPanel);
+            const int on = proc.apvts.getRawParameterValue(ids[i])->load() > 0.5f ? 1 : 0;
+            if (on != lastOn[i])
+            {
+                lastOn[i] = on;
+                const float a = on ? 1.f : 0.4f;
+                if (i == 0) for (auto& k : knobs) { k.s.setAlpha(a); k.l.setAlpha(a); }
+                if (i == 1) for (auto& k : airK)  { k.s.setAlpha(a); k.l.setAlpha(a); }
+                if (i == 2) for (auto& k : eqK)   { k.s.setAlpha(a); k.l.setAlpha(a); }
+                repaint();
+            }
         }
-        if (eqOn != lastEq)
-        {
-            lastEq = eqOn;
-            for (size_t i = 2; i < 7; ++i) setFxDim(fx[i], eqOn == 1);
-            repaint(fxPanel);
-        }
-    }
-
-    static void setFxDim(Knob& k, bool on)
-    {
-        const float a = on ? 1.f : 0.4f;
-        k.s.setAlpha(a);
-        k.l.setAlpha(a);
-    }
-
-    // kind: 0 percent, 1 kHz, 2 low-cut Hz (OFF at minimum), 3 dB
-    void setupFxKnob(Knob& k, const char* id, const char* name, int kind)
-    {
-        k.s.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
-        k.s.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 88, 18);
-        k.s.setRotaryParameters(juce::MathConstants<float>::pi * 1.2f,
-                                juce::MathConstants<float>::pi * 2.8f, true);
-        k.s.setColour(juce::Slider::textBoxTextColourId, juce::Colour(0xffe8e8e8));
-        k.s.setColour(juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
-        addAndMakeVisible(k.s);
-
-        k.l.setText(name, juce::dontSendNotification);
-        k.l.setJustificationType(juce::Justification::centred);
-        k.l.setColour(juce::Label::textColourId, juce::Colour(0xffbdbdbd));
-        k.l.setFont(juce::Font(juce::FontOptions(12.f, juce::Font::bold)));
-        addAndMakeVisible(k.l);
-
-        k.a = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(proc.apvts, id, k.s);
-
-        if (kind == 0)
-        {
-            k.s.textFromValueFunction = [](double v) { return juce::String((int) std::round(v * 100.0)) + " %"; };
-            k.s.valueFromTextFunction = [](const juce::String& t) { return t.getDoubleValue() / 100.0; };
-        }
-        else if (kind == 1)
-        {
-            k.s.textFromValueFunction = [](double v) { return juce::String(v / 1000.0, 1) + " kHz"; };
-            k.s.valueFromTextFunction = [](const juce::String& t) { return t.getDoubleValue() * 1000.0; };
-        }
-        else if (kind == 2)
-        {
-            k.s.textFromValueFunction = [](double v) { return v <= 20.5 ? juce::String("OFF") : juce::String((int) std::round(v)) + " Hz"; };
-            k.s.valueFromTextFunction = [](const juce::String& t) { return t.getDoubleValue(); };
-        }
-        else
-        {
-            k.s.textFromValueFunction = [](double v) { return juce::String(v, 1) + " dB"; };
-            k.s.valueFromTextFunction = [](const juce::String& t) { return t.getDoubleValue(); };
-        }
-        k.s.updateText();
     }
 
     void setupCombo(juce::ComboBox& box, const juce::StringArray& items)
@@ -946,7 +1027,75 @@ private:
         addAndMakeVisible(box);
     }
 
-    void applyPreset(int idx)
+    void setupPreset(juce::TextButton& b, const char* name, std::function<void()> fn)
+    {
+        b.setButtonText(name);
+        b.setColour(juce::TextButton::textColourOffId, kGold);
+        b.setColour(juce::TextButton::textColourOnId, kGold);
+        b.onClick = std::move(fn);
+        addAndMakeVisible(b);
+    }
+
+    // kind: 0 percent, 1 ms, 2 dB, 3 kHz, 4 Hz/kHz, 5 low cut (OFF at minimum), 6 high cut (OFF at maximum)
+    void setupKnob(Knob& k, const char* id, const char* name, int kind, bool gold)
+    {
+        k.s.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
+        k.s.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 84, 18);
+        k.s.setRotaryParameters(juce::MathConstants<float>::pi * 1.2f,
+                                juce::MathConstants<float>::pi * 2.8f, true);
+        k.s.setColour(juce::Slider::textBoxTextColourId, juce::Colour(0xffe8e8e8));
+        k.s.setColour(juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
+        addAndMakeVisible(k.s);
+
+        k.l.setText(name, juce::dontSendNotification);
+        k.l.setJustificationType(juce::Justification::centred);
+        k.l.setColour(juce::Label::textColourId, gold ? kGold : juce::Colour(0xffbdbdbd));
+        k.l.setFont(juce::Font(juce::FontOptions(12.f, juce::Font::bold)));
+        addAndMakeVisible(k.l);
+
+        k.a = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(proc.apvts, id, k.s);
+
+        auto hz = [](double v) -> juce::String
+        {
+            return v >= 1000.0 ? juce::String(v / 1000.0, 2) + " kHz" : juce::String((int) std::round(v)) + " Hz";
+        };
+
+        if (kind == 0)
+        {
+            k.s.textFromValueFunction = [](double v) { return juce::String((int) std::round(v * 100.0)) + " %"; };
+            k.s.valueFromTextFunction = [](const juce::String& t) { return t.getDoubleValue() / 100.0; };
+        }
+        else
+        {
+            if (kind == 1)      k.s.textFromValueFunction = [](double v) { return juce::String(v, 1) + " ms"; };
+            else if (kind == 2) k.s.textFromValueFunction = [](double v) { return juce::String(v, 1) + " dB"; };
+            else if (kind == 3) k.s.textFromValueFunction = [](double v) { return juce::String(v / 1000.0, 1) + " kHz"; };
+            else if (kind == 4) k.s.textFromValueFunction = [hz](double v) { return hz(v); };
+            else if (kind == 5) k.s.textFromValueFunction = [hz](double v) { return v <= 20.5 ? juce::String("OFF") : hz(v); };
+            else                k.s.textFromValueFunction = [hz](double v) { return v >= 19900.0 ? juce::String("OFF") : hz(v); };
+
+            k.s.valueFromTextFunction = [kind](const juce::String& t)
+            {
+                const double v = t.getDoubleValue();
+                if (kind == 3) return v * 1000.0;
+                if (kind >= 4 && t.containsIgnoreCase("k")) return v * 1000.0;
+                return v;
+            };
+        }
+        k.s.updateText();
+    }
+
+    void setParam(const char* id, float v)
+    {
+        if (auto* prm = proc.apvts.getParameter(id))
+        {
+            prm->beginChangeGesture();
+            prm->setValueNotifyingHost(prm->convertTo0to1(v));
+            prm->endChangeGesture();
+        }
+    }
+
+    void applyTunePreset(int idx)
     {
         static const float P[5][5] = {
             { 0.f,  1.f,  0.25f, 0.f,   1.f },   // HARD TUNE
@@ -956,15 +1105,35 @@ private:
             { 0.f,  1.f,  0.9f,  0.6f,  1.f }    // DESTROY
         };
         const char* ids[5] = { "retune", "amount", "robot", "grit", "mix" };
-        for (int i = 0; i < 5; ++i)
-            if (auto* prm = proc.apvts.getParameter(ids[i]))
-            {
-                prm->beginChangeGesture();
-                prm->setValueNotifyingHost(prm->convertTo0to1(P[idx][i]));
-                prm->endChangeGesture();
-            }
+        for (int i = 0; i < 5; ++i) setParam(ids[i], P[idx][i]);
+        setParam("tune_on", 1.f);
     }
 
+    void applyAirPreset(int idx)
+    {
+        static const float P[3][4] = {
+            { 0.30f, 9000.f, 0.20f, 0.60f },   // NATURAL
+            { 0.55f, 8000.f, 0.45f, 0.50f },   // BRIGHT
+            { 0.45f, 6500.f, 0.15f, 0.80f }    // SILKY
+        };
+        for (int i = 0; i < 4; ++i) setParam(kAirIds[i], P[idx][i]);
+        setParam("air_on", 1.f);
+    }
+
+    void applyEqPreset(int idx)
+    {
+        //                 lowcut low  lowF  lomid lomidF himid himidF high  highF highcut
+        static const float P[4][10] = {
+            { 20.f,  0.f,   120.f, 0.f,   350.f, 0.f,  3500.f, 0.f,  8000.f,  20000.f },  // FLAT
+            { 90.f, -1.f,   120.f, -2.5f, 320.f, 2.f,  3500.f, 3.f,  10000.f, 20000.f },  // VOCAL
+            { 70.f,  2.5f,  150.f, 1.f,   400.f, -1.f, 3000.f, 1.5f, 9000.f,  18000.f },  // WARM
+            { 300.f, 0.f,   120.f, 3.f,   900.f, 4.f,  3000.f, -6.f, 8000.f,  9000.f }    // RADIO
+        };
+        for (int i = 0; i < 10; ++i) setParam(kEqIds[i], P[idx][i]);
+        setParam("eq_on", 1.f);
+    }
+
+    //==========================================================================
     static juce::String noteName(int midiNote)
     {
         return keyNames()[((midiNote % 12) + 12) % 12];
@@ -1017,18 +1186,34 @@ private:
 
         g.setColour(juce::Colour(0xff9a9a9a));
         g.setFont(juce::Font(juce::FontOptions(12.f, juce::Font::bold)));
-        g.drawText("AGGRESSIVE PITCH CORRECTION", W - 320, 0, 300, 68, juce::Justification::centredRight);
+        g.drawText("VOCAL PROCESSOR", W - 320, 0, 300, 68, juce::Justification::centredRight);
+    }
+
+    //==========================================================================
+    void drawTunePage(juce::Graphics& g)
+    {
+        drawPanel(g, meterPanel);
+        drawPanel(g, kbPanel);
+        drawPanel(g, stripPanel);
+        drawPanel(g, knobPanel);
+        drawMeter(g);
+        drawKeyboard(g);
+
+        g.setColour(juce::Colour(0xffbdbdbd));
+        g.setFont(juce::Font(juce::FontOptions(13.f, juce::Font::bold)));
+        g.drawText("KEY", 30, 370, 28, 28, juce::Justification::centredLeft);
+        g.drawText("SCALE", 144, 370, 52, 28, juce::Justification::centredLeft);
     }
 
     void drawMeter(juce::Graphics& g)
     {
         auto r = meterPanel.toFloat();
+        const bool tuneOn = proc.apvts.getRawParameterValue("tune_on")->load() > 0.5f;
         const bool voiced = proc.meterVoiced.load();
         const float det = proc.meterDetected.load();
         const float tgt = proc.meterTarget.load();
         const float devCents = voiced ? juce::jlimit(-50.f, 50.f, (det - tgt) * 100.f) : 0.f;
 
-        // big note with glow
         g.setColour(juce::Colour(0xff777777));
         g.setFont(juce::Font(juce::FontOptions(11.f, juce::Font::bold)));
         g.drawText("TARGET NOTE", (int) r.getX() + 18, (int) r.getY() + 10, 160, 14, juce::Justification::left);
@@ -1036,21 +1221,25 @@ private:
         const juce::String nt = voiced ? noteName((int) std::round(tgt)) : "--";
         g.setFont(juce::Font(juce::FontOptions(70.f, juce::Font::bold)));
         const juce::Rectangle<int> nr((int) r.getX() + 10, (int) r.getY() + 18, 180, 80);
-        if (voiced)
+        if (voiced && tuneOn)
         {
             g.setColour(kGold.withAlpha(0.14f));
             for (int dx = -3; dx <= 3; dx += 3)
                 for (int dy = -3; dy <= 3; dy += 3)
                     g.drawText(nt, nr.translated(dx, dy), juce::Justification::centred);
         }
-        g.setColour(voiced ? kGold : juce::Colour(0xff4a4a4a));
+        g.setColour(voiced && tuneOn ? kGold : juce::Colour(0xff4a4a4a));
         g.drawText(nt, nr, juce::Justification::centred);
 
         juce::String status = "NO SIGNAL";
         juce::Colour statusCol(0xff555555);
-        if (voiced)
+        if (!tuneOn)
         {
-            if (std::abs(devCents) <= 8.f) { status = "LOCKED"; statusCol = juce::Colour(0xff39d353); }
+            status = "BYPASSED";
+        }
+        else if (voiced)
+        {
+            if (std::abs(devCents) <= 8.f) { status = "LOCKED"; statusCol = kGreen; }
             else if (devCents > 0.f)       { status = "SHARP";  statusCol = kRed; }
             else                           { status = "FLAT";   statusCol = kRed; }
         }
@@ -1067,10 +1256,9 @@ private:
         for (int i = 0; i < segs; ++i)
         {
             const float cents = (float) (i - centerIdx) * 2.5f;
-            juce::Colour on = std::abs(cents) <= 10.f ? juce::Colour(0xff39d353)
-                            : std::abs(cents) <= 25.f ? kGold : kRed;
+            juce::Colour on = std::abs(cents) <= 10.f ? kGreen : std::abs(cents) <= 25.f ? kGold : kRed;
             bool lit = false;
-            if (voiced)
+            if (voiced && tuneOn)
             {
                 const int lo = juce::jmin(centerIdx, devIdx), hi = juce::jmax(centerIdx, devIdx);
                 lit = (i >= lo && i <= hi);
@@ -1104,11 +1292,11 @@ private:
         // output level meter
         const float lvx = r.getRight() - 52.f;
         const float db = juce::Decibels::gainToDecibels(proc.outLevel.load(), -60.f);
-        const int lit = (int) std::round(juce::jmap(db, -60.f, 0.f, 0.f, 14.f));
+        const int lit = (int) std::round(juce::jlimit(0.f, 14.f, (db + 60.f) / 60.f * 14.f));
         const float segH = 6.f;
         for (int i = 0; i < 14; ++i)
         {
-            juce::Colour on = i < 9 ? juce::Colour(0xff39d353) : i < 12 ? kGold : kRed;
+            juce::Colour on = i < 9 ? kGreen : i < 12 ? kGold : kRed;
             auto seg = juce::Rectangle<float>(lvx, r.getY() + 18.f + (float) (13 - i) * (segH + 1.5f), 20.f, segH);
             g.setColour(i < lit ? on : juce::Colour(0xff191919));
             g.fillRoundedRectangle(seg, 1.5f);
@@ -1120,8 +1308,8 @@ private:
 
     void drawKeyboard(juce::Graphics& g)
     {
-        const int mask = scaleMask((int) *proc.apvts.getRawParameterValue("scale"));
-        const int key = (int) *proc.apvts.getRawParameterValue("key");
+        const int mask = scaleMask((int) proc.apvts.getRawParameterValue("scale")->load());
+        const int key = (int) proc.apvts.getRawParameterValue("key")->load();
         const bool voiced = proc.meterVoiced.load();
         const int targetNote = voiced ? (((int) std::round(proc.meterTarget.load())) % 12 + 12) % 12 : -1;
 
@@ -1174,6 +1362,194 @@ private:
             g.drawRoundedRectangle(kr, 3.f, 1.f);
             g.setColour(juce::Colours::white.withAlpha(0.18f));
             g.drawLine(kr.getX() + 3.f, kr.getY() + 3.f, kr.getRight() - 3.f, kr.getY() + 3.f, 1.f);
+        }
+    }
+
+    //==========================================================================
+    // response-curve helpers
+    static float freqToX(double f, double fmin, double fmax, juce::Rectangle<float> r)
+    {
+        return r.getX() + r.getWidth() * (float) (std::log(f / fmin) / std::log(fmax / fmin));
+    }
+    static float dbToY(double db, double lo, double hi, juce::Rectangle<float> r)
+    {
+        return r.getBottom() - r.getHeight() * (float) ((db - lo) / (hi - lo));
+    }
+
+    void drawGraphFrame(juce::Graphics& g, juce::Rectangle<float> r, double fmin, double fmax,
+                        double dbLo, double dbHi, double dbStep, std::initializer_list<double> freqs)
+    {
+        g.setColour(juce::Colour(0xff070707));
+        g.fillRoundedRectangle(r, 6.f);
+        g.setColour(kGold.withAlpha(0.2f));
+        g.drawRoundedRectangle(r, 6.f, 1.f);
+        g.setFont(juce::Font(juce::FontOptions(10.f, juce::Font::plain)));
+
+        for (double db = std::ceil(dbLo / dbStep) * dbStep; db <= dbHi + 1e-6; db += dbStep)
+        {
+            const float y = dbToY(db, dbLo, dbHi, r);
+            g.setColour(juce::Colours::white.withAlpha(std::abs(db) < 1e-6 ? 0.28f : 0.07f));
+            g.drawHorizontalLine((int) y, r.getX() + 1.f, r.getRight() - 1.f);
+            g.setColour(juce::Colour(0xff6a6a6a));
+            g.drawText((db > 0 ? "+" : "") + juce::String((int) std::round(db)),
+                       (int) r.getX() + 4, (int) y - 12, 30, 12, juce::Justification::left);
+        }
+        for (double f : freqs)
+        {
+            const float x = freqToX(f, fmin, fmax, r);
+            g.setColour(juce::Colours::white.withAlpha(0.07f));
+            g.drawVerticalLine((int) x, r.getY() + 1.f, r.getBottom() - 1.f);
+            g.setColour(juce::Colour(0xff6a6a6a));
+            const juce::String lab = f >= 1000.0 ? juce::String((int) (f / 1000.0)) + "k" : juce::String((int) f);
+            g.drawText(lab, (int) x - 15, (int) r.getBottom() - 14, 30, 12, juce::Justification::centred);
+        }
+    }
+
+    template <typename DbFn>
+    void drawCurve(juce::Graphics& g, juce::Rectangle<float> r, double fmin, double fmax,
+                   double dbLo, double dbHi, bool on, DbFn dbAt)
+    {
+        juce::Path line;
+        const int steps = juce::jmax(10, (int) (r.getWidth() / 2.f));
+        for (int s = 0; s <= steps; ++s)
+        {
+            const double f = fmin * std::pow(fmax / fmin, (double) s / (double) steps);
+            const double db = juce::jlimit(dbLo, dbHi, dbAt(f));
+            const float x = r.getX() + r.getWidth() * (float) s / (float) steps;
+            const float y = dbToY(db, dbLo, dbHi, r);
+            if (s == 0) line.startNewSubPath(x, y); else line.lineTo(x, y);
+        }
+        juce::Path fill(line);
+        const float y0 = dbToY(0.0, dbLo, dbHi, r);
+        fill.lineTo(r.getRight(), y0);
+        fill.lineTo(r.getX(), y0);
+        fill.closeSubPath();
+
+        g.saveState();
+        g.reduceClipRegion(r.toNearestInt());
+        g.setColour((on ? kGold : juce::Colour(0xff8a8a8a)).withAlpha(0.14f));
+        g.fillPath(fill);
+        g.setColour(on ? kGold : juce::Colour(0xff8a8a8a));
+        g.strokePath(line, juce::PathStrokeType(2.2f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+        g.restoreState();
+    }
+
+    void drawPageTitle(juce::Graphics& g, const char* title, const char* caption, bool on)
+    {
+        g.setColour(on ? kGold : juce::Colour(0xff8a8a8a));
+        g.setFont(juce::Font(juce::FontOptions(20.f, juce::Font::bold)));
+        g.drawText(title, 36, 130, 300, 26, juce::Justification::centredLeft);
+        g.setColour(juce::Colour(0xff777777));
+        g.setFont(juce::Font(juce::FontOptions(11.f, juce::Font::plain)));
+        g.drawText(caption, 36, 154, 360, 14, juce::Justification::centredLeft);
+    }
+
+    void drawAirPage(juce::Graphics& g)
+    {
+        drawPanel(g, fxPanel);
+        const bool on = proc.apvts.getRawParameterValue("air_on")->load() > 0.5f;
+        drawPageTitle(g, "FRESH AIR", "Silky brightness and air for the voice. It eases off on harsh S sounds.", on);
+
+        const auto r = airCurve.toFloat();
+        drawGraphFrame(g, r, 200.0, 20000.0, -3.0, 12.0, 3.0, { 500, 1000, 2000, 5000, 10000 });
+
+        const double amt  = proc.apvts.getRawParameterValue("air_amount")->load();
+        const double freq = proc.apvts.getRawParameterValue("air_freq")->load();
+        const double srd = 48000.0;
+        Biquad sh;
+        sh.setHighShelf(srd, freq * 0.8, amt * 8.0);
+        drawCurve(g, r, 200.0, 20000.0, -3.0, 12.0, on, [&](double f)
+        {
+            return 20.0 * std::log10(std::max(1e-6, std::abs(sh.response(6.283185307179586 * f / srd))));
+        });
+        const float mx = freqToX(freq, 200.0, 20000.0, r);
+        g.setColour(kGold.withAlpha(on ? 0.5f : 0.2f));
+        g.drawVerticalLine((int) mx, r.getY() + 4.f, r.getBottom() - 16.f);
+        g.setColour(juce::Colour(0xff9a9a9a));
+        g.setFont(juce::Font(juce::FontOptions(10.f, juce::Font::bold)));
+        g.drawText("SHINE", (int) mx - 25, (int) r.getY() + 4, 50, 12, juce::Justification::centred);
+
+        // activity meter: how much air is being added right now
+        const auto b = airBar.toFloat();
+        g.setColour(juce::Colour(0xff9a9a9a));
+        g.setFont(juce::Font(juce::FontOptions(11.f, juce::Font::bold)));
+        g.drawText("AIR ACTIVITY", (int) b.getX(), (int) b.getY(), 110, (int) b.getHeight(), juce::Justification::centredLeft);
+        const int segs = 40;
+        const float segW = (b.getWidth() - 120.f) / (float) segs;
+        const int lit = (int) std::round(proc.airActivity.load() * (float) segs);
+        for (int i = 0; i < segs; ++i)
+        {
+            auto seg = juce::Rectangle<float>(b.getX() + 120.f + (float) i * segW + 1.f, b.getY() + 2.f, segW - 2.f, b.getHeight() - 4.f);
+            const juce::Colour c = i < 26 ? kGold : kRed;
+            g.setColour(i < lit && on ? c : juce::Colour(0xff191919));
+            g.fillRoundedRectangle(seg, 2.f);
+        }
+    }
+
+    void drawEqPage(juce::Graphics& g)
+    {
+        drawPanel(g, fxPanel);
+        const bool on = proc.apvts.getRawParameterValue("eq_on")->load() > 0.5f;
+        drawPageTitle(g, "EQUALIZER", "Low cut, four bands with adjustable frequency, and high cut.", on);
+
+        const auto r = eqCurve.toFloat();
+        drawGraphFrame(g, r, 20.0, 20000.0, -15.0, 15.0, 5.0, { 50, 100, 200, 500, 1000, 2000, 5000, 10000 });
+
+        float v[10];
+        for (int i = 0; i < 10; ++i) v[i] = proc.apvts.getRawParameterValue(kEqIds[i])->load();
+        const double srd = 48000.0;
+        Biquad hp, lo, lm, hm, hi, lp;
+        hp.setHighPass(srd, v[0], 0.7071);
+        lo.setLowShelf(srd, v[2], v[1]);
+        lm.setPeak(srd, v[4], 0.9, v[3]);
+        hm.setPeak(srd, v[6], 0.9, v[5]);
+        hi.setHighShelf(srd, v[8], v[7]);
+        lp.setLowPass(srd, v[9], 0.7071);
+        const bool useHP = v[0] > 20.5f, useLP = v[9] < 19900.f;
+
+        auto dbAt = [&](double f)
+        {
+            const double w = 6.283185307179586 * f / srd;
+            std::complex<double> h = lo.response(w) * lm.response(w) * hm.response(w) * hi.response(w);
+            if (useHP) h *= hp.response(w);
+            if (useLP) h *= lp.response(w);
+            return 20.0 * std::log10(std::max(1e-6, std::abs(h)));
+        };
+        drawCurve(g, r, 20.0, 20000.0, -15.0, 15.0, on, dbAt);
+
+        // band handles on the curve
+        auto dot = [&](double f, double db, juce::Colour c)
+        {
+            const float x = freqToX(f, 20.0, 20000.0, r);
+            const float y = dbToY(juce::jlimit(-15.0, 15.0, db), -15.0, 15.0, r);
+            g.setColour(c.withAlpha(on ? 0.28f : 0.12f));
+            g.fillEllipse(x - 9.f, y - 9.f, 18.f, 18.f);
+            g.setColour(on ? c : c.withAlpha(0.5f));
+            g.fillEllipse(x - 5.f, y - 5.f, 10.f, 10.f);
+            g.setColour(juce::Colours::black.withAlpha(0.8f));
+            g.drawEllipse(x - 5.f, y - 5.f, 10.f, 10.f, 1.f);
+        };
+        if (useHP) dot(v[0], dbAt(v[0]), juce::Colour(0xff9a9a9a));
+        if (useLP) dot(v[9], dbAt(v[9]), juce::Colour(0xff9a9a9a));
+        dot(v[2], v[1], kBand[0]);
+        dot(v[4], v[3], kBand[1]);
+        dot(v[6], v[5], kBand[2]);
+        dot(v[8], v[7], kBand[3]);
+
+        // group captions above the knobs
+        struct Grp { int a, b; const char* name; juce::Colour c; };
+        const Grp groups[6] = { { 0, 0, "LOW CUT", juce::Colour(0xff9a9a9a) }, { 1, 2, "LOW", kBand[0] },
+                                { 3, 4, "LOW MID", kBand[1] },               { 5, 6, "HIGH MID", kBand[2] },
+                                { 7, 8, "HIGH", kBand[3] },                  { 9, 9, "HIGH CUT", juce::Colour(0xff9a9a9a) } };
+        g.setFont(juce::Font(juce::FontOptions(11.f, juce::Font::bold)));
+        for (const auto& gr : groups)
+        {
+            const int x = 36 + gr.a * 73 + 4;
+            const int w = (gr.b - gr.a + 1) * 73 - 8;
+            g.setColour(gr.c);
+            g.drawText(gr.name, x, 338, w, 14, juce::Justification::centred);
+            g.setColour(gr.c.withAlpha(0.6f));
+            g.fillRect(x, 354, w, 2);
         }
     }
 
