@@ -1,4 +1,4 @@
-// BLACK TUNE RECORD v5
+// BLACK TUNE RECORD v6 (look-ahead note tracking, pitch graph, premium UI)
 // Three independent tabs in one plugin: AUTO TUNE / FRESH AIR / EQUALIZER
 // - Auto Tune: YIN tracking + median + hysteresis, PSOLA engine with exact window normalisation
 // - Fresh Air: dynamic high-band lift + harmonic exciter with sibilance protection
@@ -115,6 +115,8 @@ public:
                              .withOutput("Output", juce::AudioChannelSet::stereo(), true)),
           apvts(*this, nullptr, "PARAMS", createLayout())
     {
+        for (auto& a : trailDet) a.store(-1.f);
+        for (auto& a : trailOut) a.store(-1.f);
     }
 
     const juce::String getName() const override { return "BLACK TUNE RECORD"; }
@@ -173,7 +175,9 @@ public:
         combLP[0] = combLP[1] = 0.f;
         lpState = 0.f; detLP = 0.f;
         snapOn = false;
-        histN = 0; histIdx = 0; unvoicedHops = 0; curNote = -1;
+        trkN = 0; lastDetVoiced = false; lastDetMidi = 60.f;
+        curNote = -1; resVoiced = false; resM = 60.f;
+        trailCnt = 0; trailEvery = juce::jmax(1, (int) std::round(0.012 * sr));
         meterVoiced = false;
 
         for (Biquad* b : { &eqHP, &eqLow, &eqLoMid, &eqHiMid, &eqHigh, &eqLP, &airHP, &airLP, &airOutHP, &airShelf }) b->reset();
@@ -204,6 +208,7 @@ public:
         keyIdx   = (int) P("key");
         scaleIdx = (int) P("scale");
         amountP = amount;
+        trackAmt = P("track");
 
         // ---- EQ / FRESH AIR parameters (smoothed per block: no zipper noise) ----
         const bool eqOn  = P("eq_on") > 0.5f;
@@ -290,10 +295,19 @@ public:
 
             if (++hopCount >= hop) { hopCount = 0; detect(); }
 
-            curMidiOut += (meterVoiced.load() ? coef : releaseCoef) * (targetMidiOut - curMidiOut);
+            curMidiOut += (resVoiced ? coef : releaseCoef) * (targetMidiOut - curMidiOut);
             curMidiOut = juce::jlimit(20.f, 120.f, curMidiOut);
 
             generateGrains(nCh);
+
+            if (++trailCnt >= trailEvery)   // history for the pitch graph
+            {
+                trailCnt = 0;
+                const int tp = trailPos.load();
+                trailDet[(size_t) tp].store(resVoiced ? resM : -1.f);
+                trailOut[(size_t) tp].store(resVoiced ? curMidiOut : -1.f);
+                trailPos.store((tp + 1) % kTrail);
+            }
 
             combT += 0.002f * ((float) (sr / (double) outFreq) - combT);
             combT = juce::jlimit(8.f, (float) (kBuf - 4), combT);
@@ -387,6 +401,11 @@ public:
     std::atomic<float> outLevel { 0.f };
     std::atomic<float> airActivity { 0.f };
 
+    // short pitch history (input pitch and corrected pitch) for the graph in the editor
+    static constexpr int kTrail = 256;
+    std::array<std::atomic<float>, kTrail> trailDet, trailOut;
+    std::atomic<int> trailPos { 0 };
+
 private:
     static constexpr int kBuf = 1 << 15;
     static constexpr int kMask = kBuf - 1;
@@ -401,8 +420,17 @@ private:
     bool snapOn = false;
     int keyIdx = 0, scaleIdx = 0;
     float amountP = 1.f;
-    float hist[5] = { 0, 0, 0, 0, 0 };
-    int histN = 0, histIdx = 0, unvoicedHops = 0, curNote = -1;
+    // pitch track: one measurement per detection hop, stamped with the input time it describes
+    struct TrackPt { double t = 0; float midi = 0, conf = 0, T0 = 0; };
+    static constexpr int kTrk = 1024;
+    std::array<TrackPt, kTrk> trk;
+    long long trkN = 0;
+    bool lastDetVoiced = false;
+    float lastDetMidi = 60.f;
+    int curNote = -1;
+    bool resVoiced = false;
+    float resM = 60.f, trackAmt = 0.5f;
+    int trailCnt = 0, trailEvery = 530;
     std::array<std::vector<float>, 2> dl, outB, comb;
     std::vector<float> wsum, det, lp, scratch, yin;
 
@@ -438,16 +466,108 @@ private:
         return (double) bestI;
     }
 
+    // Decide the target note for the audio that is about to be synthesised (input time tdes).
+    // The engine has ~33 ms of latency, so the pitch measurements AFTER tdes already exist:
+    // the note is voted from the measurements before and after that moment (no lag, no wrong
+    // notes when the singer changes note fast). Glides and glitches lose the vote.
+    void resolveTarget(double tdes)
+    {
+        const double wb = (0.005 + 0.011 * (double) trackAmt) * sr;   // look back  5..16 ms
+        const double wa = (0.006 + 0.012 * (double) trackAmt) * sr;   // look ahead 6..18 ms
+        const int mask = scaleMask(scaleIdx);
+        auto allowed = [&](int note) { return ((mask >> (((note - keyIdx) % 12 + 12) % 12)) & 1) != 0; };
+
+        int noteIds[16]; float votes[16]; int nNotes = 0;
+        float midis[16]; double times[16]; float T0s[16]; int nPts = 0;
+
+        for (long long k = trkN - 1; k >= 0 && k > trkN - kTrk + 1 && nPts < 16; --k)
+        {
+            const TrackPt& p = trk[(size_t) (k % kTrk)];
+            if (p.t < tdes - wb) break;
+            if (p.t > tdes + wa) continue;
+
+            midis[nPts] = p.midi; times[nPts] = p.t; T0s[nPts] = p.T0; ++nPts;
+
+            const double dist = std::abs(p.t - tdes) / (p.t < tdes ? wb : wa);
+            const float w = p.conf * (1.f - 0.5f * (float) dist);
+            const int near = (int) std::round(p.midi);
+            int bn = near; float bd = 1e9f;
+            for (int o = -6; o <= 6; ++o)
+            {
+                if (!allowed(near + o)) continue;
+                const float d = std::abs((float) (near + o) - p.midi);
+                if (d < bd) { bd = d; bn = near + o; }
+            }
+            int slot = -1;
+            for (int i = 0; i < nNotes; ++i) if (noteIds[i] == bn) slot = i;
+            if (slot < 0 && nNotes < 16) { slot = nNotes++; noteIds[slot] = bn; votes[slot] = 0.f; }
+            if (slot >= 0) votes[slot] += w;
+        }
+
+        if (nPts == 0)
+        {
+            // no measurement around this audio: hold the note through short gaps (consonants), then pass through
+            bool recent = false;
+            const double hold = 0.06 * sr;
+            for (long long k = trkN - 1; k >= 0 && k > trkN - 40; --k)
+            {
+                const TrackPt& p = trk[(size_t) (k % kTrk)];
+                if (p.t <= tdes) { recent = (tdes - p.t) < hold; break; }
+            }
+            if (!recent || curNote < 0)
+            {
+                resVoiced = false; snapOn = false; curNote = -1;
+                targetMidiOut = 69.f + 12.f * std::log2(((float) sr / T0cur) / 440.f);
+                meterVoiced = false;
+            }
+            return;
+        }
+
+        // winner, with hysteresis towards the note we are already on
+        int win = noteIds[0]; float wv = votes[0]; float curV = 0.f;
+        for (int i = 0; i < nNotes; ++i)
+        {
+            if (votes[i] > wv) { wv = votes[i]; win = noteIds[i]; }
+            if (noteIds[i] == curNote) curV = votes[i];
+        }
+        const float hyst = 1.f + 0.5f * trackAmt;
+        if (curNote >= 0 && allowed(curNote) && win != curNote && wv < curV * hyst) win = curNote;
+        curNote = win;
+        const float best = (float) curNote;
+
+        // pitch of the singer at tdes: median of the three nearest measurements (kills glitches)
+        int idx[16]; for (int i = 0; i < nPts; ++i) idx[i] = i;
+        std::sort(idx, idx + nPts, [&](int a, int b) { return std::abs(times[a] - tdes) < std::abs(times[b] - tdes); });
+        float near3[3]; const int n3 = juce::jmin(3, nPts);
+        for (int i = 0; i < n3; ++i) near3[i] = midis[idx[i]];
+        std::sort(near3, near3 + n3);
+        float m = near3[n3 / 2];
+        float allM[16]; for (int i = 0; i < nPts; ++i) allM[i] = midis[i];
+        std::sort(allM, allM + nPts);
+        const float wmed = allM[nPts / 2];
+        if (std::abs(m - wmed) > 1.f) m = wmed;
+
+        float allT[16]; for (int i = 0; i < nPts; ++i) allT[i] = T0s[i];
+        std::sort(allT, allT + nPts);
+        T0cur = juce::jlimit((float) (sr / 800.0), (float) (sr / 90.0), allT[nPts / 2]);
+
+        targetMidiOut = m + (best - m) * amountP;
+        resM = m; resVoiced = true; snapOn = true;
+        meterDetected = m; meterTarget = best; meterVoiced = true;
+    }
+
     // PSOLA: grains of two periods, placed exactly at the spacing of the TARGET note
     void generateGrains(int nCh)
     {
-        const double T = (double) T0cur;
         if (nextTs < (double) (wp - 4096)) nextTs = (double) wp;
 
-        while (nextTs <= (double) wp + 1.15 * T)
+        while (nextTs <= (double) wp + 1.15 * (double) T0cur)
         {
-            const int Ti = juce::jmax(8, (int) std::llround(T));
             const double tdes = nextTs - (double) delay0;
+            resolveTarget(tdes);
+
+            const double T = (double) T0cur;
+            const int Ti = juce::jmax(8, (int) std::llround(T));
 
             int guard = 0;
             while (std::abs(anaMark + T - tdes) < std::abs(anaMark - tdes) && guard++ < 16)
@@ -491,6 +611,7 @@ private:
         l.add(std::make_unique<AudioParameterChoice>(ParameterID{"key", 1}, "Key", keyNames(), 0));
         l.add(std::make_unique<AudioParameterChoice>(ParameterID{"scale", 1}, "Scale", scaleNames(), 2));
         F("retune", "Retune Speed", 0.f, 200.f, 0.1f, 0.5f, 0.f);
+        F("track",  "Tracking",     0.f, 1.f, 0.001f, 1.f, 0.5f);
         F("amount", "Amount", 0.f, 1.f, 0.001f, 1.f, 1.f);
         F("robot",  "Robot",  0.f, 1.f, 0.001f, 1.f, 0.3f);
         F("grit",   "Grit",   0.f, 1.f, 0.001f, 1.f, 0.f);
@@ -519,13 +640,14 @@ private:
         return l;
     }
 
+    // Pitch measurement (YIN). It only records "at input time t the voice had pitch p";
+    // the note decision is taken later, per grain, by resolveTarget().
     void detect()
     {
         const int N = (int) (0.0175 * sr);
         const int minTau = (int) (sr / 800.0);
         const int maxTau = (int) (sr / 90.0);
         const int total = N + maxTau;
-        const int holdHops = juce::jmax(1, (int) std::ceil(0.08 * sr / (double) hop));
 
         float energy = 0.f;
         for (int j = 0; j < total; ++j)
@@ -533,9 +655,9 @@ private:
         for (int j = maxTau; j < total; ++j) energy += scratch[(size_t) j] * scratch[(size_t) j];
 
         bool voiced = false;
-        float midiRaw = 0.f;
+        float midiRaw = 0.f, conf = 0.f, tauEst = 0.f;
 
-        if (std::sqrt(energy / (float) N) >= 0.004f)
+        if (std::sqrt(energy / (float) N) >= 0.0025f)
         {
             float cum = 0.f;
             yin[0] = 1.f;
@@ -560,73 +682,52 @@ private:
                     found = tau; break;
                 }
             }
+            // keep following a voice we were already tracking when it gets breathy or noisy
+            if (found < 0 && lastDetVoiced)
+            {
+                const float tau0 = (float) sr / (440.f * std::pow(2.f, (lastDetMidi - 69.f) / 12.f));
+                const int lo = juce::jmax(2, (int) (tau0 * 0.89f)), hi = juce::jmin(maxTau - 1, (int) (tau0 * 1.12f));
+                float mn = 1e9f; int mt = -1;
+                for (int tau = lo; tau <= hi; ++tau)
+                    if (yin[(size_t) tau] < mn) { mn = yin[(size_t) tau]; mt = tau; }
+                if (mt >= 2 && mn < 0.3f) found = mt;
+            }
+
+            // octave-down guard: if half of this period is also clearly periodic, the real period is the shorter one
+            // (happens while the pitch is moving, when the true period fails the strict threshold)
+            for (int pass = 0; pass < 2 && found >= 2; ++pass)
+            {
+                const int half = found / 2;
+                if (half < juce::jmax(2, minTau)) break;
+                const int lo2 = juce::jmax(2, (int) ((float) half * 0.93f)), hi2 = juce::jmin(maxTau - 1, (int) ((float) half * 1.07f) + 1);
+                float mn = 1e9f; int mt = -1;
+                for (int tau = lo2; tau <= hi2; ++tau)
+                    if (yin[(size_t) tau] < mn) { mn = yin[(size_t) tau]; mt = tau; }
+                if (mt >= 2 && mn < 0.4f && mn < yin[(size_t) found] * 3.f + 0.1f) found = mt; else break;
+            }
 
             if (found >= 2)
             {
-                float tauEst = (float) found;
+                tauEst = (float) found;
                 const float s0 = yin[(size_t) found - 1], s1 = yin[(size_t) found], s2 = yin[(size_t) found + 1];
                 const float den = s0 - 2.f * s1 + s2;
                 if (std::abs(den) > 1e-9f) tauEst += 0.5f * (s0 - s2) / den;
-                const float f0 = (float) sr / tauEst;
-                midiRaw = 69.f + 12.f * std::log2(f0 / 440.f);
+                conf = juce::jlimit(0.05f, 1.f, 1.f - yin[(size_t) found]);
+                midiRaw = 69.f + 12.f * std::log2(((float) sr / tauEst) / 440.f);
                 voiced = true;
+                // an octave-sized jump with low confidence is almost always a tracking error
+                if (lastDetVoiced && std::abs(midiRaw - lastDetMidi) > 10.f && conf < 0.8f) voiced = false;
             }
         }
 
-        if (!voiced)
-        {
-            if (++unvoicedHops > holdHops)
-            {
-                // no pitch: pass the voice through untouched
-                targetMidiOut = 69.f + 12.f * std::log2(((float) sr / T0cur) / 440.f);
-                snapOn = false;
-                meterVoiced = false;
-                histN = 0; histIdx = 0; curNote = -1;
-            }
-            return;
-        }
-        unvoicedHops = 0;
+        lastDetVoiced = voiced;
+        if (!voiced) return;
+        lastDetMidi = midiRaw;
 
-        // median filter over the last detections (removes octave glitches)
-        hist[histIdx] = midiRaw;
-        histIdx = (histIdx + 1) % 5;
-        histN = juce::jmin(5, histN + 1);
-        float tmp[5];
-        for (int i = 0; i < histN; ++i) tmp[i] = hist[i];
-        std::sort(tmp, tmp + histN);
-        const float med = tmp[histN / 2];
-        const float m = std::abs(midiRaw - med) < 0.7f ? midiRaw : med;
-
-        // choose target note with hysteresis (no flicker between notes)
-        const int mask = scaleMask(scaleIdx);
-        auto allowed = [&](int note) { return ((mask >> (((note - keyIdx) % 12 + 12) % 12)) & 1) != 0; };
-
-        int cand = (int) std::round(med);
-        float bestDist = 1e9f;
-        for (int o = -6; o <= 6; ++o)
-        {
-            const int note = (int) std::round(med) + o;
-            if (!allowed(note)) continue;
-            const float dist = std::abs((float) note - med);
-            if (dist < bestDist) { bestDist = dist; cand = note; }
-        }
-        if (curNote >= 0 && allowed(curNote) && cand != curNote
-            && std::abs(med - (float) cand) + 0.15f > std::abs(med - (float) curNote))
-            cand = curNote;
-        curNote = cand;
-        const float best = (float) curNote;
-
-        // the output pitch is set directly from the target note (exact), not from a ratio
-        targetMidiOut = m + (best - m) * amountP;
-
-        // analysis period for the grains
-        const float T0meas = (float) sr / (440.f * std::pow(2.f, (med - 69.f) / 12.f));
-        T0cur = juce::jlimit((float) (sr / 800.0), (float) (sr / 90.0), T0meas);
-        snapOn = true;
-
-        meterDetected = m;
-        meterTarget = best;
-        meterVoiced = true;
+        TrackPt& p = trk[(size_t) (trkN % kTrk)];
+        p.t = (double) wp - 0.5 * (double) N - 0.5 * (double) tauEst;   // centre of the analysed segment
+        p.midi = midiRaw; p.conf = conf; p.T0 = tauEst;
+        ++trkN;
     }
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(BlackTune)
@@ -638,6 +739,12 @@ static const juce::Colour kRed(0xffe02020);
 static const juce::Colour kGreen(0xff39d353);
 static const juce::Colour kBand[4] = { juce::Colour(0xffff6b5a), juce::Colour(0xffffb347),
                                        juce::Colour(0xff6fd3a8), juce::Colour(0xff6fb7ff) };
+
+// font with optional letter-spacing (tracking) for a refined look
+static juce::Font F(float h, int style = juce::Font::plain, float kern = 0.f)
+{
+    return juce::Font(juce::FontOptions(h, style).withKerningFactor(kern));
+}
 
 class BTLookAndFeel : public juce::LookAndFeel_V4
 {
@@ -651,15 +758,21 @@ public:
     }
 
     void drawRotarySlider(juce::Graphics& g, int x, int y, int width, int height,
-                          float sliderPos, float startAngle, float endAngle, juce::Slider&) override
+                          float sliderPos, float startAngle, float endAngle, juce::Slider& slider) override
     {
         auto bounds = juce::Rectangle<float>((float) x, (float) y, (float) width, (float) height).reduced(10.f);
         const float r = juce::jmin(bounds.getWidth(), bounds.getHeight()) / 2.f;
         const auto c = bounds.getCentre();
         const float ang = startAngle + sliderPos * (endAngle - startAngle);
 
-        // scale ticks
-        for (int i = 0; i <= 20; ++i)
+        // knobs that go both ways (dB) draw their arc from the centre
+        const bool bipolar = slider.getMinimum() < 0.0 && slider.getMaximum() > 0.0
+                             && std::abs(slider.getMinimum() + slider.getMaximum()) < 1e-6;
+        const float midAng = 0.5f * (startAngle + endAngle);
+        const float arcFrom = bipolar ? juce::jmin(midAng, ang) : startAngle;
+        const float arcTo   = bipolar ? juce::jmax(midAng, ang) : ang;
+
+        for (int i = 0; i <= 20; ++i)   // scale ticks
         {
             const float a = startAngle + (float) i / 20.f * (endAngle - startAngle);
             const float s = std::sin(a), co = std::cos(a);
@@ -672,47 +785,69 @@ public:
         const float arcR = r - 3.f;
         juce::Path track;
         track.addCentredArc(c.x, c.y, arcR, arcR, 0.f, startAngle, endAngle, true);
-        g.setColour(juce::Colour(0xff262626));
-        g.strokePath(track, juce::PathStrokeType(4.f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+        g.setColour(juce::Colour(0xff1d1d1d));
+        g.strokePath(track, juce::PathStrokeType(5.f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+        g.setColour(juce::Colour(0xff2e2e2e));
+        g.strokePath(track, juce::PathStrokeType(3.f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
 
-        if (sliderPos > 0.002f)
+        if (std::abs(arcTo - arcFrom) > 0.01f)
         {
             juce::Path val;
-            val.addCentredArc(c.x, c.y, arcR, arcR, 0.f, startAngle, ang, true);
-            g.setColour(kGold.withAlpha(0.18f));
-            g.strokePath(val, juce::PathStrokeType(10.f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
-            g.setColour(kGold);
-            g.strokePath(val, juce::PathStrokeType(3.5f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+            val.addCentredArc(c.x, c.y, arcR, arcR, 0.f, arcFrom, arcTo, true);
+            g.setColour(kGold.withAlpha(0.14f));
+            g.strokePath(val, juce::PathStrokeType(12.f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+            g.setColour(kGold.withAlpha(0.28f));
+            g.strokePath(val, juce::PathStrokeType(7.f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+            g.setColour(juce::Colour(0xffffd45c));
+            g.strokePath(val, juce::PathStrokeType(3.2f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
         }
 
-        // metal bezel
         const float bezelR = arcR - 5.f;
-        g.setGradientFill(juce::ColourGradient(juce::Colour(0xff767676), c.x - bezelR * 0.4f, c.y - bezelR * 0.6f,
-                                               juce::Colour(0xff0d0d0d), c.x + bezelR * 0.9f, c.y + bezelR * 0.9f, false));
-        g.fillEllipse(c.x - bezelR, c.y - bezelR, bezelR * 2.f, bezelR * 2.f);
-
-        // knurling
-        g.setColour(juce::Colours::black.withAlpha(0.55f));
-        for (int i = 0; i < 36; ++i)
+        for (int i = 4; i >= 1; --i)   // soft drop shadow
         {
-            const float a = (float) i * juce::MathConstants<float>::twoPi / 36.f;
-            const float s = std::sin(a), co = std::cos(a);
-            g.drawLine(c.x + s * (bezelR - 2.5f), c.y - co * (bezelR - 2.5f),
-                       c.x + s * bezelR, c.y - co * bezelR, 1.f);
+            g.setColour(juce::Colours::black.withAlpha(0.13f));
+            g.fillEllipse(c.x - bezelR - (float) i, c.y - bezelR - (float) i + 3.f,
+                          2.f * bezelR + 2.f * (float) i, 2.f * bezelR + 2.f * (float) i);
         }
 
-        // cap
-        const float capR = bezelR - 4.f;
-        g.setGradientFill(juce::ColourGradient(juce::Colour(0xff535353), c.x - capR * 0.3f, c.y - capR * 0.4f,
-                                               juce::Colour(0xff121212), c.x + capR * 0.8f, c.y + capR * 0.9f, true));
-        g.fillEllipse(c.x - capR, c.y - capR, capR * 2.f, capR * 2.f);
-        g.setColour(juce::Colours::white.withAlpha(0.10f));
-        g.fillEllipse(c.x - capR * 0.6f, c.y - capR * 0.85f, capR * 1.0f, capR * 0.5f);
+        // chrome bezel
+        g.setGradientFill(juce::ColourGradient(juce::Colour(0xffd2d2d2), c.x - bezelR * 0.6f, c.y - bezelR * 0.8f,
+                                               juce::Colour(0xff1c1c1c), c.x + bezelR * 0.7f, c.y + bezelR * 0.9f, false));
+        g.fillEllipse(c.x - bezelR, c.y - bezelR, bezelR * 2.f, bezelR * 2.f);
+        g.setColour(juce::Colours::black.withAlpha(0.65f));
+        g.drawEllipse(c.x - bezelR, c.y - bezelR, bezelR * 2.f, bezelR * 2.f, 1.f);
 
+        g.setColour(juce::Colours::black.withAlpha(0.5f));   // knurled edge
+        for (int i = 0; i < 48; ++i)
+        {
+            const float a = (float) i * juce::MathConstants<float>::twoPi / 48.f;
+            const float s = std::sin(a), co = std::cos(a);
+            g.drawLine(c.x + s * (bezelR - 2.2f), c.y - co * (bezelR - 2.2f),
+                       c.x + s * (bezelR - 0.4f), c.y - co * (bezelR - 0.4f), 1.f);
+        }
+
+        // brushed cap
+        const float capR = bezelR - 4.f;
+        g.setGradientFill(juce::ColourGradient(juce::Colour(0xff5c5c5c), c.x - capR * 0.4f, c.y - capR * 0.5f,
+                                               juce::Colour(0xff0f0f0f), c.x + capR * 0.8f, c.y + capR * 0.95f, true));
+        g.fillEllipse(c.x - capR, c.y - capR, capR * 2.f, capR * 2.f);
+        for (float rr = capR * 0.3f; rr < capR; rr += 2.2f)
+        {
+            g.setColour(juce::Colours::white.withAlpha(0.025f));
+            g.drawEllipse(c.x - rr, c.y - rr, rr * 2.f, rr * 2.f, 0.7f);
+        }
+        g.setGradientFill(juce::ColourGradient(juce::Colours::white.withAlpha(0.20f), c.x, c.y - capR,
+                                               juce::Colours::transparentWhite, c.x, c.y - capR * 0.1f, false));
+        g.fillEllipse(c.x - capR * 0.75f, c.y - capR * 0.95f, capR * 1.5f, capR * 0.9f);
+
+        // pointer with glow
         juce::Path p;
-        p.addRoundedRectangle(-1.6f, -capR + 2.f, 3.2f, capR * 0.5f, 1.5f);
-        g.setColour(kGold);
-        g.fillPath(p, juce::AffineTransform::rotation(ang).translated(c.x, c.y));
+        p.addRoundedRectangle(-1.7f, -capR + 2.f, 3.4f, capR * 0.5f, 1.5f);
+        const auto xf = juce::AffineTransform::rotation(ang).translated(c.x, c.y);
+        g.setColour(kGold.withAlpha(0.3f));
+        g.strokePath(p, juce::PathStrokeType(3.f), xf);
+        g.setColour(juce::Colour(0xffffd45c));
+        g.fillPath(p, xf);
     }
 
     void drawButtonBackground(juce::Graphics& g, juce::Button& b, const juce::Colour&,
@@ -728,6 +863,8 @@ public:
             if (highlighted && !sel) top = top.brighter(0.2f);
             g.setGradientFill(juce::ColourGradient(top, 0.f, r.getY(), bot, 0.f, r.getBottom(), false));
             g.fillRoundedRectangle(r, 8.f);
+            g.setColour(juce::Colours::white.withAlpha(sel ? 0.08f : 0.03f));
+            g.fillRoundedRectangle(r.reduced(1.f).withHeight(r.getHeight() * 0.48f), 7.f);
             g.setColour(kGold.withAlpha(sel ? 0.8f : 0.25f));
             g.drawRoundedRectangle(r, 8.f, 1.f);
             if (sel)
@@ -749,7 +886,7 @@ public:
 
     juce::Font getTextButtonFont(juce::TextButton& b, int) override
     {
-        return juce::Font(juce::FontOptions(b.getProperties().contains("tab") ? 14.f : 11.f, juce::Font::bold));
+        return F(b.getProperties().contains("tab") ? 14.f : 11.f, juce::Font::bold, 0.08f);
     }
 
     void drawToggleButton(juce::Graphics& g, juce::ToggleButton& b, bool highlighted, bool) override
@@ -776,7 +913,7 @@ public:
         g.drawEllipse(led, 1.f);
 
         g.setColour(on ? juce::Colours::white : juce::Colour(0xff9a9a9a));
-        g.setFont(juce::Font(juce::FontOptions(12.f, juce::Font::bold)));
+        g.setFont(F(12.f, juce::Font::bold));
         g.drawText(on ? "ON" : "OFF", r.withTrimmedLeft(24.f).toNearestInt(), juce::Justification::centred);
     }
 
@@ -802,7 +939,7 @@ class BlackTuneEditor : public juce::AudioProcessorEditor, private juce::Timer
 public:
     explicit BlackTuneEditor(BlackTune& p) : AudioProcessorEditor(&p), proc(p)
     {
-        setSize(800, 576);
+        setSize(800, 592);
         setLookAndFeel(&laf);
 
         // ---- tabs ----
@@ -822,10 +959,10 @@ public:
         tabs[0].setToggleState(true, juce::dontSendNotification);
 
         // ---- auto tune page ----
-        const char* tIds[6]   = { "retune", "amount", "robot", "grit", "mix", "output" };
-        const char* tNames[6] = { "RETUNE SPEED", "AMOUNT", "ROBOT", "GRIT", "MIX", "OUTPUT" };
-        const int tKinds[6]   = { 1, 0, 0, 0, 0, 2 };
-        for (int i = 0; i < 6; ++i) setupKnob(knobs[(size_t) i], tIds[i], tNames[i], tKinds[i], i == 0);
+        const char* tIds[7]   = { "retune", "track", "amount", "robot", "grit", "mix", "output" };
+        const char* tNames[7] = { "RETUNE SPEED", "TRACKING", "AMOUNT", "ROBOT", "GRIT", "MIX", "OUTPUT" };
+        const int tKinds[7]   = { 1, 0, 0, 0, 0, 0, 2 };
+        for (int i = 0; i < 7; ++i) setupKnob(knobs[(size_t) i], tIds[i], tNames[i], tKinds[i], i == 0);
 
         setupCombo(keyBox, keyNames());
         setupCombo(scaleBox, scaleNames());
@@ -880,16 +1017,16 @@ public:
         for (int i = 0; i < 3; ++i) tabs[(size_t) i].setBounds(20 + i * 254, 80, 252, 34);
 
         // auto tune page
-        for (int i = 0; i < 6; ++i)
+        for (int i = 0; i < 7; ++i)
         {
-            juce::Rectangle<int> col(20 + i * 127, 416, 127, 138);
+            juce::Rectangle<int> col(22 + i * 108, 436, 108, 134);
             knobs[(size_t) i].l.setBounds(col.removeFromTop(20));
             knobs[(size_t) i].s.setBounds(col);
         }
-        keyBox.setBounds(58, 370, 78, 28);
-        scaleBox.setBounds(198, 370, 150, 28);
-        for (int i = 0; i < 5; ++i) presets[(size_t) i].setBounds(362 + i * 66, 370, 62, 28);
-        tuneBtn.setBounds(700, 370, 70, 28);
+        keyBox.setBounds(58, 390, 78, 28);
+        scaleBox.setBounds(198, 390, 150, 28);
+        for (int i = 0; i < 5; ++i) presets[(size_t) i].setBounds(362 + i * 66, 390, 62, 28);
+        tuneBtn.setBounds(700, 390, 70, 28);
 
         // fresh air page
         airBtn.setBounds(700, 134, 70, 26);
@@ -963,7 +1100,7 @@ private:
         juce::Label l;
         std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> a;
     };
-    std::array<Knob, 6> knobs;
+    std::array<Knob, 7> knobs;
     std::array<Knob, 4> airK;
     std::array<Knob, 10> eqK;
     juce::ComboBox keyBox, scaleBox;
@@ -976,13 +1113,14 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> tuneA, airA, eqA;
     std::vector<juce::Component*> pageComps[3];
     int page = 0;
+    float viewC = 62.f;   // centre note of the pitch graph
     int lastOn[3] = { -1, -1, -1 };
 
     // tune page
-    const juce::Rectangle<int> meterPanel { 20, 124, 760, 130 };
-    const juce::Rectangle<int> kbPanel { 20, 262, 760, 94 };
-    const juce::Rectangle<int> stripPanel { 20, 364, 760, 40 };
-    const juce::Rectangle<int> knobPanel { 20, 412, 760, 146 };
+    const juce::Rectangle<int> meterPanel { 20, 124, 760, 94 };
+    const juce::Rectangle<int> graphPanel { 20, 226, 760, 150 };
+    const juce::Rectangle<int> stripPanel { 20, 384, 760, 40 };
+    const juce::Rectangle<int> knobPanel { 20, 432, 760, 144 };
     // air + eq pages
     const juce::Rectangle<int> fxPanel { 20, 124, 760, 444 };
     const juce::Rectangle<int> airCurve { 36, 172, 728, 170 };
@@ -1000,7 +1138,19 @@ private:
 
     void timerCallback() override
     {
-        if (page == 0)      repaint(meterPanel.getUnion(kbPanel));
+        if (page == 0)
+        {
+            // slowly re-centre the pitch graph on the notes being sung
+            float sum = 0.f; int cnt = 0;
+            const int pos = proc.trailPos.load();
+            for (int i = 0; i < 48; ++i)
+            {
+                const float v = proc.trailOut[(size_t) ((pos - 1 - i + BlackTune::kTrail * 2) % BlackTune::kTrail)].load();
+                if (v > 0.f) { sum += v; ++cnt; }
+            }
+            if (cnt > 4) viewC += 0.08f * (sum / (float) cnt - viewC);
+            repaint(meterPanel.getUnion(graphPanel));
+        }
         else if (page == 1) repaint(airCurve.getUnion(airBar));
         else                repaint(eqCurve);
 
@@ -1050,7 +1200,7 @@ private:
         k.l.setText(name, juce::dontSendNotification);
         k.l.setJustificationType(juce::Justification::centred);
         k.l.setColour(juce::Label::textColourId, gold ? kGold : juce::Colour(0xffbdbdbd));
-        k.l.setFont(juce::Font(juce::FontOptions(12.f, juce::Font::bold)));
+        k.l.setFont(F(12.f, juce::Font::bold, 0.08f));
         addAndMakeVisible(k.l);
 
         k.a = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(proc.apvts, id, k.s);
@@ -1139,16 +1289,50 @@ private:
         return keyNames()[((midiNote % 12) + 12) % 12];
     }
 
-    void drawPanel(juce::Graphics& g, juce::Rectangle<int> r)
+    void drawScrew(juce::Graphics& g, float cx, float cy)
+    {
+        g.setGradientFill(juce::ColourGradient(juce::Colour(0xff9a9a9a), cx - 2.f, cy - 2.f,
+                                               juce::Colour(0xff222222), cx + 3.f, cy + 3.f, false));
+        g.fillEllipse(cx - 3.5f, cy - 3.5f, 7.f, 7.f);
+        g.setColour(juce::Colours::black.withAlpha(0.7f));
+        g.drawEllipse(cx - 3.5f, cy - 3.5f, 7.f, 7.f, 0.8f);
+        g.drawLine(cx - 2.f, cy + 1.2f, cx + 2.f, cy - 1.2f, 1.1f);
+    }
+
+    void drawPanel(juce::Graphics& g, juce::Rectangle<int> r, bool screws = false)
     {
         auto f = r.toFloat();
-        g.setGradientFill(juce::ColourGradient(juce::Colour(0xff1b1b1b), f.getX(), f.getY(),
+        for (int i = 5; i >= 1; --i)   // soft drop shadow
+        {
+            g.setColour(juce::Colours::black.withAlpha(0.09f));
+            g.fillRoundedRectangle(f.expanded((float) i).translated(0.f, (float) i * 0.7f), 10.f + (float) i);
+        }
+        g.setGradientFill(juce::ColourGradient(juce::Colour(0xff252525), f.getX(), f.getY(),
                                                juce::Colour(0xff090909), f.getX(), f.getBottom(), false));
         g.fillRoundedRectangle(f, 10.f);
-        g.setColour(kGold.withAlpha(0.28f));
-        g.drawRoundedRectangle(f.reduced(0.5f), 10.f, 1.f);
-        g.setColour(juce::Colours::white.withAlpha(0.06f));
-        g.drawLine(f.getX() + 10.f, f.getY() + 1.5f, f.getRight() - 10.f, f.getY() + 1.5f);
+
+        g.saveState();   // fine brushed-metal lines
+        g.reduceClipRegion(r);
+        g.setColour(juce::Colours::white.withAlpha(0.012f));
+        for (int y = r.getY(); y < r.getBottom(); y += 2) g.drawHorizontalLine(y, f.getX(), f.getRight());
+        g.restoreState();
+
+        g.setColour(juce::Colours::white.withAlpha(0.05f));
+        g.drawRoundedRectangle(f.reduced(1.5f), 9.f, 1.f);
+        g.setGradientFill(juce::ColourGradient(kGold.withAlpha(0.6f), 0.f, f.getY(),
+                                               kGold.withAlpha(0.14f), 0.f, f.getBottom(), false));
+        g.drawRoundedRectangle(f.reduced(0.5f), 10.f, 1.2f);
+        g.setGradientFill(juce::ColourGradient(juce::Colours::white.withAlpha(0.05f), 0.f, f.getY(),
+                                               juce::Colours::transparentWhite, 0.f, f.getY() + f.getHeight() * 0.35f, false));
+        g.fillRoundedRectangle(f.reduced(1.f).withHeight(f.getHeight() * 0.35f), 9.f);
+
+        if (screws)
+        {
+            drawScrew(g, f.getX() + 9.f, f.getY() + 9.f);
+            drawScrew(g, f.getRight() - 9.f, f.getY() + 9.f);
+            drawScrew(g, f.getX() + 9.f, f.getBottom() - 9.f);
+            drawScrew(g, f.getRight() - 9.f, f.getBottom() - 9.f);
+        }
     }
 
     void drawHeader(juce::Graphics& g, int W)
@@ -1156,6 +1340,9 @@ private:
         g.setGradientFill(juce::ColourGradient(juce::Colour(0xff141414), 0.f, 0.f,
                                                juce::Colour(0xff050505), 0.f, 68.f, false));
         g.fillRect(0, 0, W, 68);
+        g.setGradientFill(juce::ColourGradient(juce::Colours::white.withAlpha(0.06f), 0.f, 0.f,
+                                               juce::Colours::transparentWhite, 0.f, 34.f, false));
+        g.fillRect(0, 0, W, 34);
 
         juce::ColourGradient line(kGold.withAlpha(0.f), 0.f, 0.f, kGold.withAlpha(0.f), (float) W, 0.f, false);
         line.addColour(0.5, kGold);
@@ -1181,11 +1368,11 @@ private:
         g.fillEllipse(cx - 2.5f, cy - 2.5f, 5.f, 5.f);
 
         g.setGradientFill(juce::ColourGradient(juce::Colours::white, 0.f, 16.f, kGold, 0.f, 52.f, false));
-        g.setFont(juce::Font(juce::FontOptions(32.f, juce::Font::bold)));
+        g.setFont(F(32.f, juce::Font::bold, 0.03f));
         g.drawText("BLACK TUNE RECORD", 84, 0, 480, 68, juce::Justification::centredLeft);
 
         g.setColour(juce::Colour(0xff9a9a9a));
-        g.setFont(juce::Font(juce::FontOptions(12.f, juce::Font::bold)));
+        g.setFont(F(12.f, juce::Font::bold));
         g.drawText("VOCAL PROCESSOR", W - 320, 0, 300, 68, juce::Justification::centredRight);
     }
 
@@ -1193,16 +1380,16 @@ private:
     void drawTunePage(juce::Graphics& g)
     {
         drawPanel(g, meterPanel);
-        drawPanel(g, kbPanel);
+        drawPanel(g, graphPanel, true);
         drawPanel(g, stripPanel);
-        drawPanel(g, knobPanel);
+        drawPanel(g, knobPanel, true);
         drawMeter(g);
-        drawKeyboard(g);
+        drawPitchGraph(g);
 
         g.setColour(juce::Colour(0xffbdbdbd));
-        g.setFont(juce::Font(juce::FontOptions(13.f, juce::Font::bold)));
-        g.drawText("KEY", 30, 370, 28, 28, juce::Justification::centredLeft);
-        g.drawText("SCALE", 144, 370, 52, 28, juce::Justification::centredLeft);
+        g.setFont(F(12.f, juce::Font::bold, 0.1f));
+        g.drawText("KEY", 30, 390, 28, 28, juce::Justification::centredLeft);
+        g.drawText("SCALE", 144, 390, 52, 28, juce::Justification::centredLeft);
     }
 
     void drawMeter(juce::Graphics& g)
@@ -1215,12 +1402,12 @@ private:
         const float devCents = voiced ? juce::jlimit(-50.f, 50.f, (det - tgt) * 100.f) : 0.f;
 
         g.setColour(juce::Colour(0xff777777));
-        g.setFont(juce::Font(juce::FontOptions(11.f, juce::Font::bold)));
-        g.drawText("TARGET NOTE", (int) r.getX() + 18, (int) r.getY() + 10, 160, 14, juce::Justification::left);
+        g.setFont(F(10.f, juce::Font::bold, 0.12f));
+        g.drawText("TARGET NOTE", (int) r.getX() + 18, (int) r.getY() + 8, 160, 14, juce::Justification::left);
 
         const juce::String nt = voiced ? noteName((int) std::round(tgt)) : "--";
-        g.setFont(juce::Font(juce::FontOptions(70.f, juce::Font::bold)));
-        const juce::Rectangle<int> nr((int) r.getX() + 10, (int) r.getY() + 18, 180, 80);
+        g.setFont(F(56.f, juce::Font::bold));
+        const juce::Rectangle<int> nr((int) r.getX() + 10, (int) r.getY() + 16, 180, 58);
         if (voiced && tuneOn)
         {
             g.setColour(kGold.withAlpha(0.14f));
@@ -1234,9 +1421,7 @@ private:
         juce::String status = "NO SIGNAL";
         juce::Colour statusCol(0xff555555);
         if (!tuneOn)
-        {
             status = "BYPASSED";
-        }
         else if (voiced)
         {
             if (std::abs(devCents) <= 8.f) { status = "LOCKED"; statusCol = kGreen; }
@@ -1244,11 +1429,11 @@ private:
             else                           { status = "FLAT";   statusCol = kRed; }
         }
         g.setColour(statusCol);
-        g.setFont(juce::Font(juce::FontOptions(12.f, juce::Font::bold)));
-        g.drawText(status, (int) r.getX() + 10, (int) r.getY() + 100, 180, 18, juce::Justification::centred);
+        g.setFont(F(11.f, juce::Font::bold, 0.12f));
+        g.drawText(status, (int) r.getX() + 10, (int) r.getY() + 74, 180, 16, juce::Justification::centred);
 
         // LED tuner bar
-        const float bx = r.getX() + 215.f, bw = 460.f, by = r.getY() + 50.f, bh = 32.f;
+        const float bx = r.getX() + 215.f, bw = 450.f, by = r.getY() + 34.f, bh = 26.f;
         const int segs = 41;
         const float segW = bw / (float) segs;
         const int centerIdx = segs / 2;
@@ -1271,98 +1456,171 @@ private:
                 g.setColour(on);
             }
             else
-                g.setColour(i == centerIdx ? juce::Colour(0xff3a3a3a) : juce::Colour(0xff191919));
+                g.setColour(i == centerIdx ? juce::Colour(0xff3a3a3a) : juce::Colour(0xff161616));
             g.fillRoundedRectangle(seg, 2.f);
+            g.setColour(juce::Colours::white.withAlpha(lit ? 0.18f : 0.04f));   // glass highlight
+            g.fillRoundedRectangle(seg.withHeight(seg.getHeight() * 0.42f), 2.f);
         }
         g.setColour(juce::Colour(0xff777777));
-        g.setFont(juce::Font(juce::FontOptions(11.f, juce::Font::bold)));
-        g.drawText("-50", (int) bx - 10, (int) (by + bh + 6.f), 40, 14, juce::Justification::left);
-        g.drawText("0", (int) (bx + bw * 0.5f) - 20, (int) (by + bh + 6.f), 40, 14, juce::Justification::centred);
-        g.drawText("+50", (int) (bx + bw) - 30, (int) (by + bh + 6.f), 40, 14, juce::Justification::right);
-        g.drawText("CENTS", (int) bx, (int) r.getY() + 12, 100, 14, juce::Justification::left);
+        g.setFont(F(10.f, juce::Font::bold));
+        g.drawText("-50", (int) bx - 10, (int) (by + bh + 3.f), 40, 12, juce::Justification::left);
+        g.drawText("0", (int) (bx + bw * 0.5f) - 20, (int) (by + bh + 3.f), 40, 12, juce::Justification::centred);
+        g.drawText("+50", (int) (bx + bw) - 30, (int) (by + bh + 3.f), 40, 12, juce::Justification::right);
+        g.setFont(F(10.f, juce::Font::bold, 0.12f));
+        g.drawText("CENTS", (int) bx, (int) r.getY() + 8, 100, 14, juce::Justification::left);
 
         if (voiced)
         {
             g.setColour(juce::Colours::white);
-            g.setFont(juce::Font(juce::FontOptions(14.f, juce::Font::bold)));
+            g.setFont(F(13.f, juce::Font::bold));
             g.drawText(juce::String((int) std::round((det - tgt) * 100.f)) + " cents",
-                       (int) bx, (int) r.getY() + 26, (int) bw, 18, juce::Justification::centred);
+                       (int) bx, (int) r.getY() + 8, (int) bw, 16, juce::Justification::centred);
         }
 
         // output level meter
-        const float lvx = r.getRight() - 52.f;
+        const float lvx = r.getRight() - 46.f;
         const float db = juce::Decibels::gainToDecibels(proc.outLevel.load(), -60.f);
-        const int lit = (int) std::round(juce::jlimit(0.f, 14.f, (db + 60.f) / 60.f * 14.f));
-        const float segH = 6.f;
-        for (int i = 0; i < 14; ++i)
+        const int lit = (int) std::round(juce::jlimit(0.f, 12.f, (db + 60.f) / 60.f * 12.f));
+        for (int i = 0; i < 12; ++i)
         {
-            juce::Colour on = i < 9 ? kGreen : i < 12 ? kGold : kRed;
-            auto seg = juce::Rectangle<float>(lvx, r.getY() + 18.f + (float) (13 - i) * (segH + 1.5f), 20.f, segH);
-            g.setColour(i < lit ? on : juce::Colour(0xff191919));
+            juce::Colour on = i < 8 ? kGreen : i < 10 ? kGold : kRed;
+            auto seg = juce::Rectangle<float>(lvx, r.getY() + 8.f + (float) (11 - i) * 5.6f, 20.f, 4.2f);
+            g.setColour(i < lit ? on : juce::Colour(0xff161616));
             g.fillRoundedRectangle(seg, 1.5f);
         }
         g.setColour(juce::Colour(0xff777777));
-        g.setFont(juce::Font(juce::FontOptions(11.f, juce::Font::bold)));
-        g.drawText("OUT", (int) lvx - 10, (int) r.getBottom() - 22, 40, 14, juce::Justification::centred);
+        g.setFont(F(10.f, juce::Font::bold, 0.12f));
+        g.drawText("OUT", (int) lvx - 10, (int) r.getBottom() - 20, 40, 12, juce::Justification::centred);
     }
 
-    void drawKeyboard(juce::Graphics& g)
+    static bool isBlackKey(int n)
     {
+        const int k = ((n % 12) + 12) % 12;
+        return k == 1 || k == 3 || k == 6 || k == 8 || k == 10;
+    }
+
+    // piano-roll pitch graph: what you sing (white) and what the plugin outputs (gold)
+    void drawPitchGraph(juce::Graphics& g)
+    {
+        const auto panel = graphPanel.toFloat();
+        const float keysW = 54.f;
+        const auto plot = juce::Rectangle<float>(panel.getX() + 12.f + keysW, panel.getY() + 10.f,
+                                                 panel.getWidth() - 24.f - keysW, panel.getHeight() - 20.f);
+        const auto keys = juce::Rectangle<float>(panel.getX() + 12.f, plot.getY(), keysW, plot.getHeight());
+
+        const bool tuneOn = proc.apvts.getRawParameterValue("tune_on")->load() > 0.5f;
         const int mask = scaleMask((int) proc.apvts.getRawParameterValue("scale")->load());
         const int key = (int) proc.apvts.getRawParameterValue("key")->load();
-        const bool voiced = proc.meterVoiced.load();
-        const int targetNote = voiced ? (((int) std::round(proc.meterTarget.load())) % 12 + 12) % 12 : -1;
-
         auto allowed = [&](int note) { return ((mask >> (((note - key) % 12 + 12) % 12)) & 1) != 0; };
 
-        const auto r = kbPanel.reduced(12, 9).toFloat();
-        const float w = r.getWidth() / 7.f;
-        static const int whites[7] = { 0, 2, 4, 5, 7, 9, 11 };
+        const float span = 18.f;
+        const float lo = viewC - span * 0.5f;
+        auto yOf = [&](float m) { return plot.getBottom() - plot.getHeight() * (m - lo) / span; };
+        const bool voiced = proc.meterVoiced.load();
+        const int tgtNote = voiced ? (int) std::round(proc.meterTarget.load()) : -999;
 
-        for (int i = 0; i < 7; ++i)
+        g.saveState();
+        g.reduceClipRegion(juce::Rectangle<float>(keys.getX(), plot.getY(), keys.getWidth() + 4.f + plot.getWidth(),
+                                                  plot.getHeight()).toNearestInt());
+        g.setColour(juce::Colour(0xff070707));
+        g.fillRect(plot);
+
+        for (int n = (int) std::floor(lo) - 1; n <= (int) std::ceil(lo + span) + 1; ++n)
         {
-            const int note = whites[i];
-            auto kr = juce::Rectangle<float>(r.getX() + (float) i * w, r.getY(), w, r.getHeight()).reduced(1.5f);
-            const bool isT = (note == targetNote);
-            if (isT)
+            const float yT = yOf((float) n + 0.5f), yB = yOf((float) n - 0.5f);
+            const bool al = allowed(n), blk = isBlackKey(n), tg = (n == tgtNote) && tuneOn;
+
+            // plot row
+            const auto row = juce::Rectangle<float>(plot.getX(), yT, plot.getWidth(), yB - yT);
+            g.setColour(tg ? kGold.withAlpha(0.16f)
+                        : al ? juce::Colours::white.withAlpha(blk ? 0.035f : 0.06f)
+                             : juce::Colours::black.withAlpha(0.35f));
+            g.fillRect(row);
+            g.setColour(juce::Colours::white.withAlpha(((n % 12) + 12) % 12 == 0 ? 0.16f : 0.05f));
+            g.drawHorizontalLine((int) yB, plot.getX(), plot.getRight());
+
+            // piano key
+            const auto kr = juce::Rectangle<float>(keys.getX(), yT, keys.getWidth(), yB - yT);
+            g.setGradientFill(juce::ColourGradient(al ? juce::Colour(0xfff0f0f0) : juce::Colour(0xff555555), kr.getX(), 0.f,
+                                                   al ? juce::Colour(0xffb8b8b8) : juce::Colour(0xff2b2b2b), kr.getRight(), 0.f, false));
+            g.fillRect(kr);
+            if (blk)
             {
-                g.setColour(kGold.withAlpha(0.28f));
-                g.fillRoundedRectangle(kr.expanded(3.f), 6.f);
+                const auto bk = juce::Rectangle<float>(kr.getX(), yT + 0.5f, kr.getWidth() * 0.64f, kr.getHeight() - 1.f);
+                g.setGradientFill(juce::ColourGradient(al ? juce::Colour(0xff9a1c1c) : juce::Colour(0xff1c1c1c), bk.getX(), 0.f,
+                                                       al ? juce::Colour(0xff3d0808) : juce::Colour(0xff050505), bk.getRight(), 0.f, false));
+                g.fillRect(bk);
             }
-            juce::Colour top = isT ? juce::Colour(0xffffe27a) : allowed(note) ? juce::Colour(0xfff7f7f7) : juce::Colour(0xff3d3d3d);
-            juce::Colour bot = isT ? juce::Colour(0xffd49b12) : allowed(note) ? juce::Colour(0xffc4c4c4) : juce::Colour(0xff1d1d1d);
-            g.setGradientFill(juce::ColourGradient(top, 0.f, kr.getY(), bot, 0.f, kr.getBottom(), false));
-            g.fillRoundedRectangle(kr, 4.f);
-            g.setColour(juce::Colours::black.withAlpha(0.6f));
-            g.drawRoundedRectangle(kr, 4.f, 1.f);
-            g.setColour(isT || allowed(note) ? juce::Colours::black.withAlpha(0.8f) : juce::Colour(0xff8a8a8a));
-            g.setFont(juce::Font(juce::FontOptions(12.f, juce::Font::bold)));
-            g.drawText(noteName(note), kr.toNearestInt().removeFromBottom(18), juce::Justification::centred);
+            if (tg)
+            {
+                g.setColour(kGold.withAlpha(0.65f));
+                g.fillRect(kr);
+            }
+            g.setColour(juce::Colours::black.withAlpha(0.7f));
+            g.drawHorizontalLine((int) yB, kr.getX(), kr.getRight());
+            if (((n % 12) + 12) % 12 == 0)
+            {
+                g.setColour(juce::Colours::black.withAlpha(0.75f));
+                g.setFont(F(9.f, juce::Font::bold));
+                g.drawText("C" + juce::String(n / 12 - 1), kr.toNearestInt().withTrimmedRight(3), juce::Justification::centredRight);
+            }
         }
 
-        static const int blacks[5] = { 1, 3, 6, 8, 10 };
-        static const int after[5] = { 0, 1, 3, 4, 5 };
-        const float bw = w * 0.6f;
-        const float bh = r.getHeight() * 0.58f;
-        for (int i = 0; i < 5; ++i)
+        // traces
+        g.saveState();
+        g.reduceClipRegion(plot.toNearestInt());
+        const int N = BlackTune::kTrail;
+        const int pos = proc.trailPos.load();
+        juce::Path detP, outP;
+        bool detOpen = false, outOpen = false;
+        for (int i = 0; i < N; ++i)
         {
-            const int note = blacks[i];
-            auto kr = juce::Rectangle<float>(r.getX() + (float) (after[i] + 1) * w - bw * 0.5f, r.getY(), bw, bh);
-            const bool isT = (note == targetNote);
-            if (isT)
+            const int idx = (pos + i) % N;
+            const float x = plot.getX() + plot.getWidth() * (float) i / (float) (N - 1);
+            const float dm = proc.trailDet[(size_t) idx].load();
+            const float om = proc.trailOut[(size_t) idx].load();
+            if (dm > 0.f)
             {
-                g.setColour(kGold.withAlpha(0.3f));
-                g.fillRoundedRectangle(kr.expanded(3.f), 5.f);
+                const float y = yOf(dm);
+                if (!detOpen) { detP.startNewSubPath(x, y); detOpen = true; } else detP.lineTo(x, y);
             }
-            juce::Colour top = isT ? juce::Colour(0xffffe27a) : allowed(note) ? juce::Colour(0xffec3535) : juce::Colour(0xff222222);
-            juce::Colour bot = isT ? juce::Colour(0xffd49b12) : allowed(note) ? juce::Colour(0xff7d0d0d) : juce::Colour(0xff050505);
-            g.setGradientFill(juce::ColourGradient(top, 0.f, kr.getY(), bot, 0.f, kr.getBottom(), false));
-            g.fillRoundedRectangle(kr, 3.f);
-            g.setColour(juce::Colours::black);
-            g.drawRoundedRectangle(kr, 3.f, 1.f);
-            g.setColour(juce::Colours::white.withAlpha(0.18f));
-            g.drawLine(kr.getX() + 3.f, kr.getY() + 3.f, kr.getRight() - 3.f, kr.getY() + 3.f, 1.f);
+            else detOpen = false;
+            if (om > 0.f)
+            {
+                const float y = yOf(om);
+                if (!outOpen) { outP.startNewSubPath(x, y); outOpen = true; } else outP.lineTo(x, y);
+            }
+            else outOpen = false;
         }
+        g.setColour(juce::Colours::white.withAlpha(0.6f));
+        g.strokePath(detP, juce::PathStrokeType(1.3f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+        g.setColour(kGold.withAlpha(0.22f));
+        g.strokePath(outP, juce::PathStrokeType(8.f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+        g.setColour(juce::Colour(0xffffd45c));
+        g.strokePath(outP, juce::PathStrokeType(2.4f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+
+        g.setGradientFill(juce::ColourGradient(juce::Colour(0xff070707).withAlpha(0.95f), plot.getX(), 0.f,
+                                               juce::Colours::transparentBlack, plot.getX() + 90.f, 0.f, false));
+        g.fillRect(plot.withWidth(90.f));
+        if (!tuneOn)
+        {
+            g.setColour(juce::Colours::black.withAlpha(0.45f));
+            g.fillRect(plot);
+        }
+        // legend
+        g.setFont(F(9.f, juce::Font::bold, 0.1f));
+        const float lx = plot.getRight() - 128.f, ly = plot.getY() + 7.f;
+        g.setColour(juce::Colours::white.withAlpha(0.7f));
+        g.drawLine(lx, ly + 5.f, lx + 14.f, ly + 5.f, 1.4f);
+        g.drawText("INPUT", (int) lx + 18, (int) ly, 40, 10, juce::Justification::left);
+        g.setColour(juce::Colour(0xffffd45c));
+        g.drawLine(lx + 62.f, ly + 5.f, lx + 76.f, ly + 5.f, 2.4f);
+        g.drawText("TUNED", (int) lx + 80, (int) ly, 40, 10, juce::Justification::left);
+        g.restoreState();
+
+        g.setColour(kGold.withAlpha(0.25f));
+        g.drawRect(plot, 1.f);
+        g.restoreState();
     }
 
     //==========================================================================
@@ -1383,7 +1641,7 @@ private:
         g.fillRoundedRectangle(r, 6.f);
         g.setColour(kGold.withAlpha(0.2f));
         g.drawRoundedRectangle(r, 6.f, 1.f);
-        g.setFont(juce::Font(juce::FontOptions(10.f, juce::Font::plain)));
+        g.setFont(F(10.f, juce::Font::plain));
 
         for (double db = std::ceil(dbLo / dbStep) * dbStep; db <= dbHi + 1e-6; db += dbStep)
         {
@@ -1437,16 +1695,16 @@ private:
     void drawPageTitle(juce::Graphics& g, const char* title, const char* caption, bool on)
     {
         g.setColour(on ? kGold : juce::Colour(0xff8a8a8a));
-        g.setFont(juce::Font(juce::FontOptions(20.f, juce::Font::bold)));
+        g.setFont(F(20.f, juce::Font::bold));
         g.drawText(title, 36, 130, 300, 26, juce::Justification::centredLeft);
         g.setColour(juce::Colour(0xff777777));
-        g.setFont(juce::Font(juce::FontOptions(11.f, juce::Font::plain)));
+        g.setFont(F(11.f, juce::Font::plain));
         g.drawText(caption, 36, 154, 360, 14, juce::Justification::centredLeft);
     }
 
     void drawAirPage(juce::Graphics& g)
     {
-        drawPanel(g, fxPanel);
+        drawPanel(g, fxPanel, true);
         const bool on = proc.apvts.getRawParameterValue("air_on")->load() > 0.5f;
         drawPageTitle(g, "FRESH AIR", "Silky brightness and air for the voice. It eases off on harsh S sounds.", on);
 
@@ -1466,13 +1724,13 @@ private:
         g.setColour(kGold.withAlpha(on ? 0.5f : 0.2f));
         g.drawVerticalLine((int) mx, r.getY() + 4.f, r.getBottom() - 16.f);
         g.setColour(juce::Colour(0xff9a9a9a));
-        g.setFont(juce::Font(juce::FontOptions(10.f, juce::Font::bold)));
+        g.setFont(F(10.f, juce::Font::bold));
         g.drawText("SHINE", (int) mx - 25, (int) r.getY() + 4, 50, 12, juce::Justification::centred);
 
         // activity meter: how much air is being added right now
         const auto b = airBar.toFloat();
         g.setColour(juce::Colour(0xff9a9a9a));
-        g.setFont(juce::Font(juce::FontOptions(11.f, juce::Font::bold)));
+        g.setFont(F(11.f, juce::Font::bold));
         g.drawText("AIR ACTIVITY", (int) b.getX(), (int) b.getY(), 110, (int) b.getHeight(), juce::Justification::centredLeft);
         const int segs = 40;
         const float segW = (b.getWidth() - 120.f) / (float) segs;
@@ -1488,7 +1746,7 @@ private:
 
     void drawEqPage(juce::Graphics& g)
     {
-        drawPanel(g, fxPanel);
+        drawPanel(g, fxPanel, true);
         const bool on = proc.apvts.getRawParameterValue("eq_on")->load() > 0.5f;
         drawPageTitle(g, "EQUALIZER", "Low cut, four bands with adjustable frequency, and high cut.", on);
 
@@ -1541,7 +1799,7 @@ private:
         const Grp groups[6] = { { 0, 0, "LOW CUT", juce::Colour(0xff9a9a9a) }, { 1, 2, "LOW", kBand[0] },
                                 { 3, 4, "LOW MID", kBand[1] },               { 5, 6, "HIGH MID", kBand[2] },
                                 { 7, 8, "HIGH", kBand[3] },                  { 9, 9, "HIGH CUT", juce::Colour(0xff9a9a9a) } };
-        g.setFont(juce::Font(juce::FontOptions(11.f, juce::Font::bold)));
+        g.setFont(F(11.f, juce::Font::bold));
         for (const auto& gr : groups)
         {
             const int x = 36 + gr.a * 73 + 4;
